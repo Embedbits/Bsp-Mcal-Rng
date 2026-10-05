@@ -3,6 +3,63 @@
 This module provides an abstraction for controlling and retrieving data from the hardware Random Number Generator (RNG).  
 It offers initialization, configuration, execution control, error handling, and data retrieval functionality.
 
+Each STM32 family is supported in a **dedicated branch** of this repository (`STM32U5`, `STM32H5`, ...)
+with a common public interface.
+
+---
+
+## 📘 STM32H5 specifics
+
+- **Kernel clock** (`rng_ClkSource_t`, RCC_CCIPR5.RNGSEL): `HSI48`, `PLL1Q`, `LSE`, `LSI`.
+  Internal oscillators (HSI48, LSI) are started automatically by the RCC module when the peripheral clock
+  is activated; LSE and PLL1 Q output shall be configured by the application. 48 MHz is required for NIST compliance.
+- **NIST configuration** uses device specific values from the CMSIS device header
+  (`RNG_CR_NIST_VALUE`, `RNG_HTCR_NIST_VALUE`, `RNG_NSCR_NIST_VALUE`, see AN4230).
+- **AIS-31 configurations** are available only on devices with the RNG version shared with STM32U5
+  (STM32H503 / H523 / H533, `RNG_CR_NIST_VALUE == 0x00F00D00`). Other devices (STM32H56x / H57x, ...)
+  reject them by `Rng_Set_Configuration()`. On the STM32U5 RNG version the NIST and AIS-31 high entropy
+  configurations use the same register values, `Rng_Get_Configuration()` reports NIST.
+- Every configuration change (CR config bits, CLKDIV, CED, ARDIS, NSCR, HTCR) is written with conditioning
+  soft reset (CONDRST), the module waits for its completion and verifies the value by read-back.
+  Locked configuration (CONFIGLOCK) is reported as error.
+
+### Behavior notes
+
+- `Rng_Init()` selects the kernel clock, stops the generator, disables the interrupt and applies the
+  configuration; the generation is started by `Rng_Set_ExecActive()`.
+- `Rng_Get_Data()` returns `RNG_REQUEST_OK` only for a complete 128-bit block read without seed error.
+- Blocking style - `Rng_Task()` clears and reports errors (error callback), otherwise delivers data
+  (data ready callback). Interrupt style - the same is done by the ISR.
+- `Rng_Set_ExecPauseActive()` stops the delivery; in interrupt style the peripheral interrupt is masked
+  while paused. `Rng_Get_ExecState()` reads active also while paused.
+- `Rng_Clear_Error( SEED_ERR )` performs the recovery sequence (conditioning reset) when auto reset is disabled.
+
+### Typical usage
+
+```c
+#include "Rng_Port.h"
+
+static void App_RandomReady( rng_RandomData_t value )
+{
+    // 4 x 32-bit random words
+}
+
+void App_RngInit( void )
+{
+    rng_ConfigStruct_t rngConfig;
+
+    (void)Rng_Get_DefaultConfig( &rngConfig );  // HSI48 (started by RCC), NIST, blocking
+    rngConfig.TransferStyle   = RNG_TRANSFER_INTERRUPT;
+    rngConfig.IrqPrio         = 5u;
+    rngConfig.DataRdyCallback = App_RandomReady;
+
+    if( RNG_REQUEST_OK == Rng_Init( &rngConfig ) )
+    {
+        (void)Rng_Set_ExecActive( RNG_PERIPH_1 );
+    }
+}
+```
+
 ---
 
 ## Public Types
@@ -20,7 +77,7 @@ It offers initialization, configuration, execution control, error handling, and 
 
 ### Identification & Configuration Types
 - `rng_PeriphId_t` – Peripheral identifier (e.g. `RNG_PERIPH_1`).  
-- `rng_ClkSource_t` – RNG clock source selection.  
+- `rng_ClkSource_t` – RNG kernel clock source selection (H5: `HSI48`, `PLL1Q`, `LSE`, `LSI`).  
 - `rng_ClkDivider_t` – RNG clock divider selection.  
 - `rng_ConfigSelection_t` – RNG mode configuration (e.g. `NIST`, `AIS_31_SPEED`, `AIS_31_ENTROPY`).  
 - `rng_Error_t` – Error mask (e.g. `SEED_ERR`, `CLOCK_ERR`).  
