@@ -122,6 +122,32 @@ rng_RequestState_t Rng_Get_IrqPriority(rng_PeriphId_t rngId, rng_IrqPrio_t * con
 
 ---
 
+## STM32L4 / STM32L4+ specifics
+
+- **Kernel clock** (`rng_ClkSource_t`, RCC_CCIPR.CLK48SEL shared with USB and SDMMC): `HSI48`, `PLLSAI1Q`, `PLLQ`, `MSI`.
+  HSI48 and MSI are started by the RCC module, PLL outputs Q shall be configured and running. The list contains the
+  sources of the device line only (no `HSI48` on STM32L47x / L48x, no `PLLSAI1Q` on STM32L41x / L42x), the items are
+  guarded by the CMSIS feature macros of the device header.
+  Default source: HSI48, on STM32L47x / L48x main PLL output Q (40 MHz in the RCC default configuration).
+- **Three RNG variants** (selected by the CMSIS register definitions):
+
+| Feature | STM32L4 | STM32L4R / L4S | STM32L4P5 / L4Q5 |
+|---------|---------|----------------|------------------|
+| Clock error detection | always active (no CED, deactivation rejected) | CED, changed with stopped generator (restarted by the module) | CED with conditioning reset (CONDRST) |
+| Configuration | fixed, reported as `NIST` | fixed, reported as `NIST` | `NIST` values of the CMSIS device header (`RNG_CR_CONFIG_VAL`, `RNG_HTCFG`) with conditioning reset, configuration lock respected |
+| Clock divider (`rng_ClkDivider_t`) | list with `RNG_CLK_DIV_1` only | list with `RNG_CLK_DIV_1` only | list with CLKDIV 1 - 32768 (conditioning reset) |
+| Auto reset | inactive (no ARDIS) | inactive (no ARDIS) | always active (automatic reset, no ARDIS) |
+| Seed error recovery (`Rng_Clear_Error()`) | SEIS cleared, RNGEN 1 -> 0 -> 1 | SEIS cleared, RNGEN 1 -> 0 -> 1 | CONDRST pulse if SECS active, SEIS cleared |
+
+- **AIS-31 configurations** are not defined for STM32L4 / STM32L4+ and are rejected.
+- **HTCR** (STM32L4P5 / L4Q5) is written with every configuration (magic key and NIST value), it is not read back
+  (access requires the magic key write). The LL function `LL_RNG_SetHealthConfig()` ignores its parameter, the module
+  writes the register directly.
+- **Interrupt**: STM32L4 lines with HASH (STM32L4A6) share the line `HASH_RNG`, the module owns the handler.
+- STM32L4 errata sheets not reviewed yet.
+
+---
+
 ## 🛠 CMake Integration
 
 1. Include `Rng_Lib` in your CMake library.
