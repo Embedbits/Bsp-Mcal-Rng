@@ -1,6 +1,6 @@
 /**
  * \author Mr.Nobody
- * \file Rng.h
+ * \file Rng.c
  * \ingroup Rng
  * \brief Random Number Generator (RNG) module common functionality
  *
@@ -10,96 +10,118 @@
  * (analog) and an internal conditioning component.
  * The RNG is a NIST SP 800-90B compliant entropy source that can be used to
  * construct a nondeterministic random bit generator (NDRBG).
- * The RNG true random number generator can be certified NIST SP800-90B. It can
- * also be tested using the German BSI statistical tests of AIS-31 (T0 to T8).
  *
  * # RNG main features #
- * • The RNG delivers 32-bit true random numbers, produced by an analog entropy
- *   source conditioned by a NIST SP800-90B approved conditioning stage.
- * • It can be used as the entropy source to construct a nondeterministic random
- *   bit generator (NDRBG).
- * • In the NIST configuration, it produces four 32-bit random samples every
- *   412 AHB clock cycles if fAHB < fthreshold (256 RNG clock cycles otherwise).
- * • It embeds startup and NIST SP800-90B approved continuous health tests
- *   (repetition count and adaptive proportion tests), associated with specific
- *   error management
- * • It can be disabled to reduce power consumption, or enabled with an automatic
- *   low power mode (default configuration).
- * • It has an AMBA® AHB slave peripheral, accessible through 32-bit word single
- *   accesses only (else an AHB bus error is generated, and the write accesses
- *   are ignored).
+ * - 32-bit true random numbers, delivered in 128-bit blocks (4 word FIFO).
+ * - Startup and NIST SP800-90B approved continuous health tests (repetition
+ *   count and adaptive proportion tests), associated error management.
+ * - Clock error detection (RNG clock too low compared to AHB clock).
+ * - Configuration lock (CONFIGLOCK) - once set, the configuration can be
+ *   changed only after system reset.
+ *
+ * # Configuration changes #
+ * Every change of the conditioning configuration (RNG_CONFIG1/2/3, NISTC, CLKDIV,
+ * CED, ARDIS, NSCR, HTCR) is done with conditioning soft reset (CONDRST) set,
+ * the module waits until the hardware finishes the reset (CONDRST reads 0) and
+ * verifies the written value by read-back.
+ *
+ * \note  Interrupt style: a new block is ready shortly after the previous one
+ *        is read, the data ready interrupt therefore follows immediately after
+ *        every delivered block and the ISR occupies the CPU. The application
+ *        shall pause the delivery (\ref Rng_Set_ExecPauseActive, allowed also
+ *        from the data ready callback) when it has enough data.
  *
  */
 /* ============================== INCLUDES ================================== */
 #include "Rng.h"                            /* Self include                   */
-#include "Rng_Port.h"                       /* Public functions include       */
+#include "Rng_Port.h"                       /* Own port file include          */
 #include "Rng_Types.h"                      /* Module types definitions       */
-#include "Rcc_Port.h"                       /* RCC functionality              */
-#include "Nvic_Port.h"                      /* NVIC functionality             */
-#include "Stm32.h"                          /* MCU common functionality       */
+#include "Rcc_Port.h"                       /* RCC handler functionality      */
+#include "Nvic_Port.h"                      /* NVIC handler functionality     */
 #include "Stm32_rng.h"                      /* RNG peripheral functionality   */
 /* ============================== TYPEDEFS ================================== */
 
-/** Enumeration used to signal execution state of peripheral */
-typedef enum
-{
-    RNG_EXEC_STATE_IDLE = 0u, /**< Peripheral is idle (not processing data)       */
-    RNG_EXEC_STATE_BUSY,      /**< Peripheral is busy (processing data)           */
-    RNG_EXEC_STATE_PAUSED,    /**< Peripheral is paused (processing is suspended) */
-    RNG_EXEC_STATE_ERROR,     /**< Peripheral is in error state                   */
-    RNG_EXEC_STATE_CNT
-}   rng_ExecState_t;
-
-
-/** Structure type used for USART/UART configuration array */
+/** \brief Peripheral configuration item */
 typedef struct
 {
-    RNG_TypeDef*          RngReg;  /**< RNG configuration register */
-    rcc_PeriphId_t        RngRcc;  /**< RNG RCC configuration ID   */
-    nvic_PeriphIrqList_t  RngNvic; /**< RNG NVIC configuration ID  */
-    nvic_IsrCallback_t    RngIsr;  /**< RNG ISR callback routines  */
-}   usart_ConfigStruct_t;
+    RNG_TypeDef          *RngReg;  /**< RNG peripheral registers */
+    nvic_PeriphIrqList_t  RngNvic; /**< RNG NVIC configuration ID */
+    nvic_IsrCallback_t    RngIsr;  /**< RNG ISR routine          */
+}   rng_PeriphConfig_t;
 
 
-/** Structure type used to store users USART/UART ISR callback pointers */
+/** \brief Runtime data of the peripheral */
 typedef struct
 {
-    rng_PeriphId_t         RngPeriphId;     /**< Peripheral ID       */
-    rng_TransferStyle_t    TransferStyle;   /**< Data transfer style */
-    rng_ExecState_t        ExecState;       /**< Execution state     */
-
-    rng_DataRdyCallback_t *DataRdyCallback; /**< Data ready callback */
-    rng_ErrCallback_t     *ErrorCallback;   /**< Error callback      */
-
+    rng_TransferStyle_t    TransferStyle;   /**< Data transfer style                     */
+    rng_ExecState_t        ExecState;       /**< Execution state                         */
+    rcc_PeriphId_t         RngRcc;          /**< RCC ID of the selected kernel clock     */
+    rng_DataRdyCallback_t *DataRdyCallback; /**< Data ready callback                     */
+    rng_ErrCallback_t     *ErrorCallback;   /**< Error callback                          */
 }   rng_RuntimeData_t;
 
 
-/** Structure type used to store peripheral configuration values */
-typedef struct
-{
-    rng_ConfigSelection_t ConfigSelection; /**< Configuration selection  */
-    uint32_t              CrRegVal;        /**< CR Register value        */
-    uint32_t              HtcrRegVal;      /**< HTCR Register value      */
-    uint32_t              NscrRegVal;      /**< NSCR Register value      */
-}   rng_ConfigurationList_t;
+/** \brief LL function returning register (bit field) value of the peripheral */
+typedef uint32_t ( *rng_LlGetter_t )( const RNG_TypeDef *rngReg );
 
 /* ======================== FORWARD DECLARATIONS ============================ */
 
-static void Rng_IsrHandler( void );
+static rng_RequestState_t   Rng_Wait_RegState       ( rng_PeriphId_t rngId, rng_LlGetter_t llGetter, uint32_t reqValue );
+static rng_RequestState_t   Rng_Set_CondReset       ( rng_PeriphId_t rngId );
+
+static void                 Rng_IsrHandler          ( void );
 
 /* ========================== SYMBOLIC CONSTANTS ============================ */
 
 /** Value of major version of SW module */
-#define RNG_MAJOR_VERSION           ( 1u )
+#define RNG_MAJOR_VERSION               ( 1u )
 
 /** Value of minor version of SW module */
-#define RNG_MINOR_VERSION           ( 0u )
+#define RNG_MINOR_VERSION               ( 0u )
 
 /** Value of patch version of SW module */
-#define RNG_PATCH_VERSION           ( 0u )
+#define RNG_PATCH_VERSION               ( 0u )
 
-/** Maximum wait time for configuration request confirmation */
-#define RNG_TIMEOUT_RAW             ( 0x84FCB )
+/** Maximal wait time for configuration request confirmation */
+#define RNG_TIMEOUT_RAW                 ( 0x84FCB )
+
+/** LL flag / state function return value signaling active state */
+#define RNG_LL_STATE_ACTIVE             ( 1u )
+
+/** LL flag / state function return value signaling inactive state */
+#define RNG_LL_STATE_INACTIVE           ( 0u )
+
+/** Default interrupt priority used by \ref Rng_Get_DefaultConfig */
+#define RNG_DEFAULT_IRQ_PRIO            ( 0u )
+
+/** CR register bits selecting the conditioning configuration */
+#define RNG_CR_CONFIG_MASK              ( RNG_CR_RNG_CONFIG1 | RNG_CR_RNG_CONFIG2 | RNG_CR_RNG_CONFIG3 | RNG_CR_NISTC )
+
+#if defined(RNG_NSCR_EN_OSC6)
+/** NSCR register reset value - all noise sources enabled (RNG with six oscillators) */
+#define RNG_NSCR_RESET_VALUE            ( RNG_NSCR_EN_OSC1 | RNG_NSCR_EN_OSC2 | RNG_NSCR_EN_OSC3 | \
+                                          RNG_NSCR_EN_OSC4 | RNG_NSCR_EN_OSC5 | RNG_NSCR_EN_OSC6 )
+#else
+/** NSCR register reset value - all noise sources enabled (RNG with three oscillators - STM32H5E4, STM32H5E5, STM32H5F4, STM32H5F5) */
+#define RNG_NSCR_RESET_VALUE            ( RNG_NSCR_EN_OSC1 | RNG_NSCR_EN_OSC2 | RNG_NSCR_EN_OSC3 )
+#endif /* RNG_NSCR_EN_OSC6 */
+
+#if defined(RNG_NSCR_NIST_VALUE)
+/** NSCR register value of NIST configuration (device specific, AN4230) */
+#define RNG_NSCR_NIST_CONFIG            ( RNG_NSCR_NIST_VALUE )
+#else
+/** NSCR register value of NIST configuration - device has no specific value, reset value is used */
+#define RNG_NSCR_NIST_CONFIG            ( RNG_NSCR_RESET_VALUE )
+#endif /* RNG_NSCR_NIST_VALUE */
+
+/** CR register value of AIS-31 high speed configuration (STM32U5 RNG version) */
+#define RNG_CR_AIS31_SPEED_VALUE        ( 0x01801000u )
+
+/** CR register value of AIS-31 high entropy configuration (STM32U5 RNG version) */
+#define RNG_CR_AIS31_ENTROPY_VALUE      ( 0x00F00D00u )
+
+/** HTCR register value of AIS-31 configurations (STM32U5 RNG version) */
+#define RNG_HTCR_AIS31_VALUE            ( 0x0000AAC7u )
 
 /* =============================== MACROS =================================== */
 
@@ -107,22 +129,41 @@ static void Rng_IsrHandler( void );
 
 /* =========================== LOCAL VARIABLES ============================== */
 
-static volatile rng_RuntimeData_t       rng_RuntimeData[ RNG_PERIPH_CNT ] =
+/** \brief Peripheral configuration, indexed by \ref rng_PeriphId_t */
+static const rng_PeriphConfig_t rng_PeriphConf[ RNG_PERIPH_CNT ] =
 {
-    { .RngPeriphId = RNG_PERIPH_1, .TransferStyle = RNG_TRANSFER_BLOCKING, .ExecState = RNG_EXEC_STATE_IDLE, .DataRdyCallback = RNG_NULL_PTR, .ErrorCallback = RNG_NULL_PTR },
-};
-
-static usart_ConfigStruct_t const       rng_PeriphConf[ RNG_PERIPH_CNT ] =
-{
-    { .RngReg = RNG, .RngRcc = RCC_PERIPH_RNG_HSI48, .RngNvic = NVIC_PERIPH_IRQ_RNG, .RngIsr = Rng_IsrHandler },
+    { .RngReg = RNG, .RngNvic = NVIC_PERIPH_IRQ_RNG, .RngIsr = Rng_IsrHandler },
 };
 
 
-static rng_ConfigurationList_t const    rng_ConfigList[ RNG_CONFIG_SELECTION_CNT ] =
+/** \brief RCC IDs of kernel clock sources, indexed by \ref rng_ClkSource_t */
+static const rcc_PeriphId_t rng_ClkSourceLut[ ] =
 {
-    { .ConfigSelection = RNG_CONFIG_SELECTION_NIST          , .CrRegVal = RNG_CR_NIST_VALUE, .HtcrRegVal = RNG_HTCR_NIST_VALUE, .NscrRegVal = RNG_NSCR_NIST_VALUE  },
-    { .ConfigSelection = RNG_CONFIG_SELECTION_AIS_31_SPEED  , .CrRegVal = 0x01801000       , .HtcrRegVal = 0x0000AAC7         , .NscrRegVal = 0x0003ffff           },
-    { .ConfigSelection = RNG_CONFIG_SELECTION_AIS_31_ENTROPY, .CrRegVal = 0x00F00D00       , .HtcrRegVal = 0x0000AAC7         , .NscrRegVal = 0x0003ffff           },
+    RCC_PERIPH_RNG_HSI48     , /**< \ref RNG_CLK_SOURCE_HSI48      */
+    RCC_PERIPH_RNG_HSI48_DIV2, /**< \ref RNG_CLK_SOURCE_HSI48_DIV2 */
+    RCC_PERIPH_RNG_HSI       , /**< \ref RNG_CLK_SOURCE_HSI16      */
+};
+
+_Static_assert( RNG_CLK_SOURCE_CNT == ( sizeof( rng_ClkSourceLut ) / sizeof( rcc_PeriphId_t ) ), "RNG clock source LUT size mismatch" );
+
+
+/** \brief Conditioning configurations, indexed by \ref rng_ConfigSelection_t */
+static const rng_ConfigurationList_t rng_ConfigList[ ] =
+{
+    { .Supported = RNG_FUNCTION_ACTIVE, .CrRegVal = RNG_CR_NIST_VALUE         , .HtcrRegVal = RNG_HTCR_NIST_VALUE , .NscrRegVal = RNG_NSCR_NIST_CONFIG }, /**< \ref RNG_CONFIG_SELECTION_NIST           */
+#if ( RNG_CR_NIST_VALUE == 0x00F00D00u )
+    { .Supported = RNG_FUNCTION_ACTIVE, .CrRegVal = RNG_CR_AIS31_SPEED_VALUE  , .HtcrRegVal = RNG_HTCR_AIS31_VALUE, .NscrRegVal = RNG_NSCR_RESET_VALUE }, /**< \ref RNG_CONFIG_SELECTION_AIS_31_SPEED   */
+    { .Supported = RNG_FUNCTION_ACTIVE, .CrRegVal = RNG_CR_AIS31_ENTROPY_VALUE, .HtcrRegVal = RNG_HTCR_AIS31_VALUE, .NscrRegVal = RNG_NSCR_RESET_VALUE }, /**< \ref RNG_CONFIG_SELECTION_AIS_31_ENTROPY */
+#endif /* RNG_CR_NIST_VALUE */
+};
+
+_Static_assert( RNG_CONFIG_SELECTION_CNT == ( sizeof( rng_ConfigList ) / sizeof( rng_ConfigurationList_t ) ), "RNG configuration LUT size mismatch" );
+
+
+/** \brief Runtime data, indexed by \ref rng_PeriphId_t */
+static volatile rng_RuntimeData_t rng_RuntimeData[ RNG_PERIPH_CNT ] =
+{
+    { .TransferStyle = RNG_TRANSFER_NONE, .ExecState = RNG_EXEC_STATE_IDLE, .RngRcc = RCC_PERIPH_RNG_HSI48, .DataRdyCallback = RNG_NULL_PTR, .ErrorCallback = RNG_NULL_PTR },
 };
 
 /* ========================= EXPORTED FUNCTIONS ============================= */
@@ -147,10 +188,17 @@ rng_ModuleVersion_t Rng_Get_ModuleVersion( void )
 /**
  * \brief Initialization of Random Number Generator (RNG) peripheral
  *
- * \note The clock for RNG shall be configured to 48MHz. Otherwise error will
- *       be raised.
+ * Sequence: generator stop, interrupt deactivation, kernel clock selection and
+ * activation (clock of the previous source released), conditioning configuration,
+ * callbacks and transfer style storage, interrupt configuration
+ * (\ref RNG_TRANSFER_INTERRUPT only).
  *
- * \param rngConfig [in]: Peripheral configuration structure
+ * \note  The generator is not started, call \ref Rng_Set_ExecActive afterwards.
+ * \note  Internal oscillator of the selected clock source (HSI48, HSI16) is started
+ *        by RCC module. The RNG kernel clock shall be 48 MHz for NIST compliance.
+ *
+ * \param rngConfig [in]: Peripheral configuration structure. Must not be NULL.
+ *
  * \return State of request execution. Returns "OK" if request was success,
  *         otherwise return error.
  */
@@ -158,54 +206,78 @@ rng_RequestState_t Rng_Init( rng_ConfigStruct_t * const rngConfig )
 {
     rng_RequestState_t retState = RNG_REQUEST_ERROR;
 
-    if( RNG_NULL_PTR != rngConfig )
+    if( ( RNG_NULL_PTR       != rngConfig                ) &&
+        ( RNG_PERIPH_CNT      > rngConfig->PeriphId      ) &&
+        ( RNG_TRANSFER_CNT    > rngConfig->TransferStyle ) &&
+        ( RNG_CLK_SOURCE_CNT  > rngConfig->ClkSource     )    )
     {
-        retState = Rng_Set_ClkSource( rngConfig->PeriphId, rngConfig->ClkSource );
+        const rng_PeriphId_t rngId = rngConfig->PeriphId;
 
-        if( RNG_REQUEST_ERROR != retState )
+        /*------------- Generator of previous initialization stopped -----------*/
+        retState = Rng_Set_ExecInactive( rngId );
+
+        if( RNG_REQUEST_OK == retState )
         {
-            retState = Rng_Set_Configuration( rngConfig->PeriphId, rngConfig->ConfigSelection );
-        }
-
-        /*----------------------- Configure peripheral -----------------------*/
-
-        if( RNG_REQUEST_ERROR != retState )
-        {
-            retState = Rng_Set_DataRdyCallback( rngConfig->PeriphId, rngConfig->DataRdyCallback );
-        }
-
-        if( RNG_REQUEST_ERROR != retState )
-        {
-            retState = Rng_Set_ErrorCallback( rngConfig->PeriphId, rngConfig->ErrorCallback );
-        }
-
-        /*------------------- Transfer mode configuration --------------------*/
-
-        if( RNG_TRANSFER_INTERRUPT == rngConfig->TransferStyle )
-        {
-            if( RNG_REQUEST_ERROR != retState )
-            {
-                retState = Rng_Set_IrqPriority( rngConfig->PeriphId, rngConfig->IrqPrio );
-            }
-
-            if( RNG_REQUEST_ERROR != retState )
-            {
-                retState = Rng_Set_IrqActive( rngConfig->PeriphId );
-            }
-        }
-        else if( RNG_TRANSFER_BLOCKING == rngConfig->TransferStyle )
-        {
-            retState = RNG_REQUEST_OK;
+            retState = Rng_Set_IrqInactive( rngId );
         }
         else
         {
-            /* None of the supported transfer styles was selected.
-             * User will handle it by himself. */
+            /* Generator was not stopped */
+        }
+
+        /*----------------------- Clock and peripheral -----------------------*/
+        if( RNG_REQUEST_OK == retState )
+        {
+            retState = Rng_Set_ClkSource( rngId, rngConfig->ClkSource );
+        }
+        else
+        {
+            /* Previous step failed */
+        }
+
+        if( RNG_REQUEST_OK == retState )
+        {
+            retState = Rng_Set_Configuration( rngId, rngConfig->ConfigSelection );
+        }
+        else
+        {
+            /* Previous step failed */
+        }
+
+        /*------------------------- Transfer handling ------------------------*/
+        if( RNG_REQUEST_OK == retState )
+        {
+            rng_RuntimeData[ rngId ].TransferStyle   = rngConfig->TransferStyle;
+            rng_RuntimeData[ rngId ].DataRdyCallback = rngConfig->DataRdyCallback;
+            rng_RuntimeData[ rngId ].ErrorCallback   = rngConfig->ErrorCallback;
+        }
+        else
+        {
+            /* Previous step failed */
+        }
+
+        if( ( RNG_REQUEST_OK         == retState                 ) &&
+            ( RNG_TRANSFER_INTERRUPT == rngConfig->TransferStyle )    )
+        {
+            retState = Rng_Set_IrqPriority( rngId, rngConfig->IrqPrio );
+
+            if( RNG_REQUEST_OK == retState )
+            {
+                retState = Rng_Set_IrqActive( rngId );
+            }
+            else
+            {
+                /* Priority configuration failed */
+            }
+        }
+        else
+        {
+            /* Interrupts are not used or previous step failed */
         }
     }
     else
     {
-        /* Null pointer assigned */
+        /* Null pointer or invalid configuration */
         retState = RNG_REQUEST_ERROR;
     }
 
@@ -216,89 +288,122 @@ rng_RequestState_t Rng_Init( rng_ConfigStruct_t * const rngConfig )
 /**
  * \brief Deinitializes module Rng
  *
- * This function shall call every necessary sub-module deinitialization function 
- * and free all the resources allocated by the module. In case of failure, the 
- * function shall handle it by itself and shall not be transferred to AppMain 
- * layer.
+ * Disables interrupt (NVIC and peripheral), stops the generator, resets the
+ * peripheral, disables its clock and removes user callbacks.
+ *
+ * \param rngConfig [in]: Peripheral configuration structure (only PeriphId is used).
+ *                        Must not be NULL.
+ *
+ * \return State of request execution. Returns "OK" if request was success,
+ *         otherwise return error.
  */
 rng_RequestState_t Rng_Deinit( rng_ConfigStruct_t * const rngConfig )
 {
     rng_RequestState_t retState = RNG_REQUEST_ERROR;
 
-    rcc_RequestState_t rccState = Rcc_Set_PeriphInactive( rng_PeriphConf[ rngConfig->PeriphId ].RngRcc );
-
-    if( RCC_REQUEST_ERROR == rccState )
+    if( ( RNG_NULL_PTR  != rngConfig           ) &&
+        ( RNG_PERIPH_CNT > rngConfig->PeriphId )    )
     {
-        /* Clock was not successfully deactivated */
-        retState = RNG_REQUEST_ERROR;
+        const rng_PeriphId_t rngId = rngConfig->PeriphId;
+
+        /* -1- Interrupt and generator */
+        const rng_RequestState_t irqState  = Rng_Set_IrqInactive( rngId );
+        const rng_RequestState_t execState = Rng_Set_ExecInactive( rngId );
+
+        /* -2- Peripheral reset and clock */
+        const rcc_RequestState_t rstActState   = Rcc_Set_ResetActive( rng_RuntimeData[ rngId ].RngRcc );
+        const rcc_RequestState_t rstInactState = Rcc_Set_ResetInactive( rng_RuntimeData[ rngId ].RngRcc );
+        const rcc_RequestState_t clkState      = Rcc_Set_PeriphInactive( rng_RuntimeData[ rngId ].RngRcc );
+
+        /* -3- Runtime data */
+        rng_RuntimeData[ rngId ].TransferStyle   = RNG_TRANSFER_NONE;
+        rng_RuntimeData[ rngId ].ExecState       = RNG_EXEC_STATE_IDLE;
+        rng_RuntimeData[ rngId ].DataRdyCallback = RNG_NULL_PTR;
+        rng_RuntimeData[ rngId ].ErrorCallback   = RNG_NULL_PTR;
+
+        if( ( RNG_REQUEST_OK == irqState      ) &&
+            ( RNG_REQUEST_OK == execState     ) &&
+            ( RCC_REQUEST_OK == rstActState   ) &&
+            ( RCC_REQUEST_OK == rstInactState ) &&
+            ( RCC_REQUEST_OK == clkState      )    )
+        {
+            retState = RNG_REQUEST_OK;
+        }
+        else
+        {
+            retState = RNG_REQUEST_ERROR;
+        }
     }
     else
     {
-        retState = RNG_REQUEST_OK;
+        retState = RNG_REQUEST_ERROR;
     }
 
-    return (retState);
+    return ( retState );
 }
 
 
 /**
  * \brief Main task of module Rng
  *
- * This function shall be called in the main loop of the application or the task
- * scheduler. It shall be called periodically, depending on the module's 
- * requirements.
+ * Processes peripherals initialized with \ref RNG_TRANSFER_BLOCKING while the
+ * generation is running (not paused). Active errors are cleared and reported
+ * by error callback, data generated without error are reported by data ready
+ * callback. Shall be called periodically.
  */
 void Rng_Task( void )
 {
-    rng_Error_t errorState = RNG_ERROR_NONE;
-
-    for( uint32_t periphId = 0u; RNG_PERIPH_CNT > periphId; periphId++ )
+    for( rng_PeriphId_t rngId = RNG_PERIPH_1; RNG_PERIPH_CNT > rngId; rngId ++ )
     {
-        if( ( RNG_TRANSFER_BLOCKING == rng_RuntimeData[ periphId ].TransferStyle ) &&
-            ( RNG_EXEC_STATE_BUSY   == rng_RuntimeData[ periphId ].ExecState     )    )
+        if( ( RNG_TRANSFER_BLOCKING == rng_RuntimeData[ rngId ].TransferStyle ) &&
+            ( RNG_EXEC_STATE_BUSY   == rng_RuntimeData[ rngId ].ExecState     )    )
         {
-            /* In blocking mode, check if data is ready */
-            rng_FunctionState_t dataReadyState = RNG_FUNCTION_INACTIVE;
+            rng_Error_t         errMask    = RNG_ERROR_NONE;
+            rng_FunctionState_t readyState = RNG_FUNCTION_INACTIVE;
 
-            Rng_Get_DataReadyState( (rng_PeriphId_t) periphId, &dataReadyState );
+            (void)Rng_Get_Error( rngId, &errMask );
 
-            if( RNG_FUNCTION_ACTIVE == dataReadyState )
+            if( RNG_ERROR_NONE != errMask )
             {
-                rng_RandomData_t generatedData;
+                (void)Rng_Clear_Error( rngId, errMask );
 
-                (void)Rng_Get_Data( (rng_PeriphId_t) periphId, &generatedData );
-
-                if ( RNG_NULL_PTR != rng_RuntimeData[ periphId ].DataRdyCallback )
+                if( RNG_NULL_PTR != rng_RuntimeData[ rngId ].ErrorCallback )
                 {
-                    rng_RuntimeData[ periphId ].DataRdyCallback( generatedData );
+                    rng_RuntimeData[ rngId ].ErrorCallback( errMask );
                 }
                 else
                 {
-                    /* No callback assigned, data will be lost */
+                    /* Error callback is not configured */
                 }
             }
             else
             {
-                /* No data ready, nothing to do. */
+                (void)Rng_Get_DataReadyState( rngId, &readyState );
             }
 
-            (void)Rng_Get_Error( (rng_PeriphId_t) periphId, &errorState );
-
-            if( RNG_ERROR_NONE != errorState )
+            if( RNG_FUNCTION_ACTIVE == readyState )
             {
-                if ( RNG_NULL_PTR != rng_RuntimeData[ periphId ].ErrorCallback )
+                rng_RandomData_t         randData;
+                const rng_RequestState_t dataState = Rng_Get_Data( rngId, &randData );
+
+                if( ( RNG_REQUEST_OK == dataState                            ) &&
+                    ( RNG_NULL_PTR   != rng_RuntimeData[ rngId ].DataRdyCallback )    )
                 {
-                    rng_RuntimeData[ periphId ].ErrorCallback( errorState );
+                    rng_RuntimeData[ rngId ].DataRdyCallback( randData );
+                }
+                else
+                {
+                    /* Data are not valid or callback is not configured */
                 }
             }
             else
             {
-                /* No error detected, nothing to do. */
+                /* No data ready or error was processed */
             }
         }
         else
         {
-            /* In interrupt mode, nothing to do here */
+            /* Peripheral is not polled by the task */
         }
     }
 }
@@ -307,7 +412,11 @@ void Rng_Task( void )
 /**
  * \brief Loads default values for Random Number Generator (RNG) peripheral
  *
- * \param rngConfig [out]: Pointer to configuration structure
+ * Default configuration: RNG_PERIPH_1, HSI48 kernel clock, NIST configuration,
+ * blocking transfer style, interrupt priority 0, no callbacks.
+ *
+ * \param rngConfig [out]: Pointer to configuration structure. Must not be NULL.
+ *
  * \return State of request execution. Returns "OK" if request was success,
  *         otherwise return error.
  */
@@ -317,25 +426,15 @@ rng_RequestState_t Rng_Get_DefaultConfig( rng_ConfigStruct_t *rngConfig )
 
     if( RNG_NULL_PTR != rngConfig )
     {
-        nvic_IrqPrio_t      irqPrio   = 0u;
-        nvic_RequestState_t nvicState = NVIC_REQUEST_ERROR;
-
-        nvicState = Nvic_Get_PeriphIrq_Prio( rng_PeriphConf[ RNG_PERIPH_1 ].RngNvic, &irqPrio );
-
-        if( NVIC_REQUEST_OK != nvicState )
-        {
-            retState  = RNG_REQUEST_ERROR;
-        }
-        else
-        {
-            retState  = RNG_REQUEST_OK;
-        }
-
         rngConfig->PeriphId        = RNG_PERIPH_1;
+        rngConfig->ClkSource       = RNG_CLK_SOURCE_HSI48;
+        rngConfig->ConfigSelection = RNG_CONFIG_SELECTION_NIST;
         rngConfig->TransferStyle   = RNG_TRANSFER_BLOCKING;
-        rngConfig->IrqPrio         = irqPrio;
+        rngConfig->IrqPrio         = RNG_DEFAULT_IRQ_PRIO;
         rngConfig->DataRdyCallback = RNG_NULL_PTR;
         rngConfig->ErrorCallback   = RNG_NULL_PTR;
+
+        retState = RNG_REQUEST_OK;
     }
     else
     {
@@ -352,6 +451,7 @@ rng_RequestState_t Rng_Get_DefaultConfig( rng_ConfigStruct_t *rngConfig )
  * After activation of RNG peripheral, this will start with generating data values.
  *
  * \param rngId [in]: Peripheral identification
+ *
  * \return State of request execution. Returns "OK" if request was success,
  *         otherwise return error.
  */
@@ -361,24 +461,23 @@ rng_RequestState_t Rng_Set_ExecActive( rng_PeriphId_t rngId )
 
     if( RNG_PERIPH_CNT > rngId )
     {
+        /* State is set before the generator is enabled - in interrupt style the
+         * data ready interrupt follows immediately and the ISR delivers data
+         * only while the generation is running */
+        rng_RuntimeData[ rngId ].ExecState = RNG_EXEC_STATE_BUSY;
+
         LL_RNG_Enable( rng_PeriphConf[ rngId ].RngReg );
 
-        for( uint32_t iterationCnt = 0u; RNG_TIMEOUT_RAW > iterationCnt; iterationCnt ++ )
+        retValue = Rng_Wait_RegState( rngId, LL_RNG_IsEnabled, RNG_LL_STATE_ACTIVE );
+
+        if( RNG_REQUEST_OK != retValue )
         {
-            uint32_t regValue  = LL_RNG_IsEnabled( rng_PeriphConf[ rngId ].RngReg );
-
-            if( 0u != regValue )
-            {
-                rng_RuntimeData[ rngId ].ExecState = RNG_EXEC_STATE_BUSY;
-
-                retValue = RNG_REQUEST_OK;
-                break;
-            }
-            else
-            {
-                /* Clock source has not yet been changed, keep return state as error */
-                retValue = RNG_REQUEST_ERROR;
-            }
+            /* Generator has not been enabled */
+            rng_RuntimeData[ rngId ].ExecState = RNG_EXEC_STATE_IDLE;
+        }
+        else
+        {
+            /* Generation is running */
         }
     }
     else
@@ -393,7 +492,10 @@ rng_RequestState_t Rng_Set_ExecActive( rng_PeriphId_t rngId )
 /**
  * \brief Deactivates Random Number Generator (RNG) peripheral.
  *
+ * Generator is stopped, configuration and peripheral clock are kept.
+ *
  * \param rngId [in]: Peripheral identification
+ *
  * \return State of request execution. Returns "OK" if request was success,
  *         otherwise return error.
  */
@@ -403,33 +505,17 @@ rng_RequestState_t Rng_Set_ExecInactive( rng_PeriphId_t rngId )
 
     if( RNG_PERIPH_CNT > rngId )
     {
-        rcc_RequestState_t rccState = Rcc_Set_PeriphInactive( rng_PeriphConf[ rngId ].RngRcc );
-        if( RCC_REQUEST_ERROR != rccState )
+        LL_RNG_Disable( rng_PeriphConf[ rngId ].RngReg );
+
+        retValue = Rng_Wait_RegState( rngId, LL_RNG_IsEnabled, RNG_LL_STATE_INACTIVE );
+
+        if( RNG_REQUEST_OK == retValue )
         {
-            /* Clock was not successfully activated */
-            retValue = RNG_REQUEST_ERROR;
+            rng_RuntimeData[ rngId ].ExecState = RNG_EXEC_STATE_IDLE;
         }
         else
         {
-            LL_RNG_Disable( rng_PeriphConf[ rngId ].RngReg );
-
-            for( uint32_t iterationCnt = 0u; RNG_TIMEOUT_RAW > iterationCnt; iterationCnt ++ )
-            {
-                uint32_t regValue  = LL_RNG_IsEnabled( rng_PeriphConf[ rngId ].RngReg );
-
-                if( 0u == regValue )
-                {
-                    rng_RuntimeData[ rngId ].ExecState = RNG_EXEC_STATE_IDLE;
-
-                    retValue = RNG_REQUEST_OK;
-                    break;
-                }
-                else
-                {
-                    /* Clock source has not yet been changed, keep return state as error */
-                    retValue = RNG_REQUEST_ERROR;
-                }
-            }
+            /* Generator has not been disabled */
         }
     }
     else
@@ -444,10 +530,9 @@ rng_RequestState_t Rng_Set_ExecInactive( rng_PeriphId_t rngId )
 /**
  * \brief Returns current state of peripheral data processing.
  *
- * This function returns current state of peripheral data processing.
- *
  * \param rngId  [in]: Peripheral identification
- * \param state [out]: Pointer to variable where current state will be stored
+ * \param state [out]: Pointer to store state, \ref RNG_FUNCTION_ACTIVE if the
+ *                     generation is running (also when paused). Must not be NULL.
  *
  * \return State of request execution. Returns "OK" if request was success,
  *         otherwise return error.
@@ -459,7 +544,7 @@ rng_RequestState_t Rng_Get_ExecState( rng_PeriphId_t rngId, rng_FunctionState_t 
     if( ( RNG_PERIPH_CNT > rngId ) &&
         ( RNG_NULL_PTR  != state )    )
     {
-        if( RNG_EXEC_STATE_BUSY == rng_RuntimeData[ rngId ].ExecState )
+        if( RNG_EXEC_STATE_IDLE != rng_RuntimeData[ rngId ].ExecState )
         {
             *state = RNG_FUNCTION_ACTIVE;
         }
@@ -480,9 +565,14 @@ rng_RequestState_t Rng_Get_ExecState( rng_PeriphId_t rngId, rng_FunctionState_t 
 
 
 /**
- * \brief Pauses Random Number Generator (RNG) peripheral execution.
+ * \brief Pauses Random Number Generator (RNG) peripheral data delivery.
  *
- * In blocking mode, the processing is done in task function.
+ * Blocking style: \ref Rng_Task stops processing of the peripheral.
+ * Interrupt style: peripheral interrupt is disabled (\ref Rng_Get_IrqState
+ * reads inactive while paused).
+ *
+ * \pre   Generation shall be running (\ref Rng_Set_ExecActive), otherwise
+ *        \ref RNG_REQUEST_ERROR.
  *
  * \param rngId [in]: Peripheral identification
  *
@@ -493,18 +583,28 @@ rng_RequestState_t Rng_Set_ExecPauseActive( rng_PeriphId_t rngId )
 {
     rng_RequestState_t retValue = RNG_REQUEST_ERROR;
 
-    if( RNG_PERIPH_CNT > rngId )
+    if( ( RNG_PERIPH_CNT      > rngId                                ) &&
+        ( RNG_EXEC_STATE_BUSY == rng_RuntimeData[ rngId ].ExecState )    )
     {
-        if( RNG_EXEC_STATE_BUSY == rng_RuntimeData[rngId].ExecState )
+        if( RNG_TRANSFER_INTERRUPT == rng_RuntimeData[ rngId ].TransferStyle )
         {
-            /* In blocking mode, the processing is done in task function. */
-            rng_RuntimeData[ rngId ].ExecState = RNG_EXEC_STATE_PAUSED;
+            LL_RNG_DisableIT( rng_PeriphConf[ rngId ].RngReg );
 
-            retValue = RNG_REQUEST_OK;
+            retValue = Rng_Wait_RegState( rngId, LL_RNG_IsEnabledIT, RNG_LL_STATE_INACTIVE );
         }
         else
         {
-            retValue = RNG_REQUEST_ERROR;
+            /* Blocking style is processed by the task */
+            retValue = RNG_REQUEST_OK;
+        }
+
+        if( RNG_REQUEST_OK == retValue )
+        {
+            rng_RuntimeData[ rngId ].ExecState = RNG_EXEC_STATE_PAUSED;
+        }
+        else
+        {
+            /* Interrupt has not been disabled */
         }
     }
     else
@@ -517,9 +617,10 @@ rng_RequestState_t Rng_Set_ExecPauseActive( rng_PeriphId_t rngId )
 
 
 /**
- * \brief Resumes Random Number Generator (RNG) peripheral execution.
+ * \brief Resumes Random Number Generator (RNG) peripheral data delivery.
  *
- * In blocking mode, the processing is done in task function.
+ * \pre   Generation shall be paused (\ref Rng_Set_ExecPauseActive), otherwise
+ *        \ref RNG_REQUEST_ERROR.
  *
  * \param rngId [in]: Peripheral identification
  *
@@ -530,18 +631,44 @@ rng_RequestState_t Rng_Set_ExecPauseInactive( rng_PeriphId_t rngId )
 {
     rng_RequestState_t retValue = RNG_REQUEST_ERROR;
 
-    if( RNG_PERIPH_CNT > rngId )
+    if( ( RNG_PERIPH_CNT        > rngId                                ) &&
+        ( RNG_EXEC_STATE_PAUSED == rng_RuntimeData[ rngId ].ExecState )    )
     {
-        if( RNG_EXEC_STATE_PAUSED == rng_RuntimeData[ rngId ].ExecState )
-        {
-            /* In blocking mode, the processing is done in task function. */
-            rng_RuntimeData[ rngId ].ExecState = RNG_EXEC_STATE_BUSY;
+        /* State is set before the interrupt is enabled - pending data ready
+         * interrupt follows immediately (see \ref Rng_Set_ExecActive) */
+        rng_RuntimeData[ rngId ].ExecState = RNG_EXEC_STATE_BUSY;
 
-            retValue = RNG_REQUEST_OK;
+        if( RNG_TRANSFER_INTERRUPT == rng_RuntimeData[ rngId ].TransferStyle )
+        {
+            LL_RNG_EnableIT( rng_PeriphConf[ rngId ].RngReg );
+
+            retValue = Rng_Wait_RegState( rngId, LL_RNG_IsEnabledIT, RNG_LL_STATE_ACTIVE );
+
+            if( ( RNG_REQUEST_OK      != retValue                            ) &&
+                ( RNG_EXEC_STATE_BUSY != rng_RuntimeData[ rngId ].ExecState )    )
+            {
+                /* Delivery was resumed and paused again from the data ready callback */
+                retValue = RNG_REQUEST_OK;
+            }
+            else
+            {
+                /* Interrupt enable confirmed or not applied */
+            }
         }
         else
         {
-            retValue = RNG_REQUEST_ERROR;
+            /* Blocking style is processed by the task */
+            retValue = RNG_REQUEST_OK;
+        }
+
+        if( RNG_REQUEST_OK != retValue )
+        {
+            /* Interrupt has not been enabled */
+            rng_RuntimeData[ rngId ].ExecState = RNG_EXEC_STATE_PAUSED;
+        }
+        else
+        {
+            /* Delivery resumed */
         }
     }
     else
@@ -556,10 +683,8 @@ rng_RequestState_t Rng_Set_ExecPauseInactive( rng_PeriphId_t rngId )
 /**
  * \brief Returns current pause state of peripheral data processing.
  *
- * This function returns current pause state of peripheral data processing.
- *
  * \param rngId  [in]: Peripheral identification
- * \param state [out]: Pointer to variable where current pause state will be stored
+ * \param state [out]: Pointer to store pause state. Must not be NULL.
  *
  * \return State of request execution. Returns "OK" if request was success,
  *         otherwise return error.
@@ -571,7 +696,7 @@ rng_RequestState_t Rng_Get_ExecPauseState( rng_PeriphId_t rngId, rng_FunctionSta
     if( ( RNG_PERIPH_CNT > rngId ) &&
         ( RNG_NULL_PTR  != state )    )
     {
-        if( RNG_EXEC_STATE_PAUSED == rng_RuntimeData[rngId].ExecState )
+        if( RNG_EXEC_STATE_PAUSED == rng_RuntimeData[ rngId ].ExecState )
         {
             *state = RNG_FUNCTION_ACTIVE;
         }
@@ -587,34 +712,72 @@ rng_RequestState_t Rng_Get_ExecPauseState( rng_PeriphId_t rngId, rng_FunctionSta
         retValue = RNG_REQUEST_ERROR;
     }
 
-    return (retValue);
+    return ( retValue );
 }
 
 
 /**
- * \brief Returns actual data from output register
+ * \brief Reads one 128-bit block of random data from the output FIFO.
  *
- * \return Value of generated data
+ * Every word is read after data ready flag (DRDY). Data are valid only if no
+ * seed error occurred during the read (SEIS checked after the block, see
+ * reference manual - data read with seed error must not be used).
+ *
+ * \param rngId [in] : Peripheral identification
+ * \param data  [out]: Pointer to store random data. Must not be NULL.
+ *
+ * \return Returns \ref RNG_REQUEST_OK if the complete block was read without
+ *         seed error. Returns \ref RNG_REQUEST_ERROR if no data are ready,
+ *         seed error occurred or parameters are invalid.
  */
 rng_RequestState_t Rng_Get_Data( rng_PeriphId_t rngId, rng_RandomData_t * const data )
 {
-    rng_FunctionState_t dataReadyState = RNG_FUNCTION_INACTIVE;
-    rng_RequestState_t  retValue       = RNG_REQUEST_ERROR;
+    rng_RequestState_t retValue = RNG_REQUEST_ERROR;
 
-    retValue = Rng_Get_DataReadyState( rngId, &dataReadyState );
-
-    if( ( RNG_FUNCTION_ACTIVE == dataReadyState ) &&
-        ( RNG_REQUEST_OK      == retValue       ) &&
-        ( RNG_NULL_PTR        != data           )    )
+    if( ( RNG_PERIPH_CNT > rngId ) &&
+        ( RNG_NULL_PTR  != data  )    )
     {
-        for( uint32_t index = 0u; RNG_FIFO_LEN > index; index++ )
+        const uint32_t readyState = LL_RNG_IsActiveFlag_DRDY( rng_PeriphConf[ rngId ].RngReg );
+
+        if( RNG_LL_STATE_ACTIVE == readyState )
         {
-            data->value[ index ] = LL_RNG_ReadRandData32( rng_PeriphConf[ rngId ].RngReg );
+            for( uint32_t index = 0u; RNG_FIFO_LEN > index; index ++ )
+            {
+                retValue = Rng_Wait_RegState( rngId, LL_RNG_IsActiveFlag_DRDY, RNG_LL_STATE_ACTIVE );
+
+                if( RNG_REQUEST_OK == retValue )
+                {
+                    data->value[ index ] = LL_RNG_ReadRandData32( rng_PeriphConf[ rngId ].RngReg );
+                }
+                else
+                {
+                    /* Next word of the block is not available */
+                    break;
+                }
+            }
+
+            const uint32_t seedErrState = LL_RNG_IsActiveFlag_SEIS( rng_PeriphConf[ rngId ].RngReg );
+
+            if( ( RNG_REQUEST_OK      == retValue     ) &&
+                ( RNG_LL_STATE_ACTIVE == seedErrState )    )
+            {
+                /* Seed error - data must not be used */
+                retValue = RNG_REQUEST_ERROR;
+            }
+            else
+            {
+                /* Block read without seed error or read failed */
+            }
+        }
+        else
+        {
+            /* No data ready */
+            retValue = RNG_REQUEST_ERROR;
         }
     }
     else
     {
-        /* No data ready or incorrect peripheral ID requested. */
+        retValue = RNG_REQUEST_ERROR;
     }
 
     return ( retValue );
@@ -627,22 +790,21 @@ rng_RequestState_t Rng_Get_Data( rng_PeriphId_t rngId, rng_RandomData_t * const 
  * \brief Sets configuration of Random Number Generator (RNG) peripheral.
  *
  * The Random Number Generator (RNG) offers three configurations for the
- * conditioning component.
- * Each configuration is compliant with different standards and provides
- * different throughput and entropy rate on the output.
- * The configurations are:
+ * conditioning component. Each configuration is compliant with different
+ * standards and provides different throughput and entropy rate on the output:
  *
- * - NIST SP800-90B compliant configuration:
- *   The conditioning component is based on a cryptographic hash function
- *   (SHA-256) and provides full entropy on the output (128-bit).
+ * - NIST SP800-90B compliant configuration (device specific values from CMSIS
+ *   device header, see AN4230).
+ * - AIS-31 T0 to T8 compliant configuration - high speed.
+ * - AIS-31 T0 to T8 compliant configuration - high entropy.
  *
- * - AIS-31 T0 to T8 compliant configuration - high speed
- *   The conditioning component is based on a linear feedback shift register
- *   (LFSR) and provides lower entropy on the output (128-bit).
+ * Configuration is written with conditioning soft reset (CR config bits, NSCR,
+ * HTCR) and verified by read-back. Clock divider, clock error detection and
+ * auto reset are not changed.
  *
- * - AIS-31 T0 to T8 compliant configuration - high entropy
- *   The conditioning component is based on a cryptographic hash function
- *   (SHA-256) and provides full entropy on the output (128-bit).
+ * \pre   Configuration shall be supported by the device (AIS-31 only on RNG
+ *        version shared with STM32U5) and configuration shall not be locked
+ *        (CONFIGLOCK); otherwise \ref RNG_REQUEST_ERROR and no register is changed.
  *
  * \param rngId           [in]: RNG peripheral ID
  * \param configSelection [in]: Configuration selection
@@ -654,18 +816,46 @@ rng_RequestState_t Rng_Set_Configuration( rng_PeriphId_t rngId, rng_ConfigSelect
 {
     rng_RequestState_t retValue = RNG_REQUEST_ERROR;
 
-    if( ( RNG_PERIPH_CNT           > rngId           ) &&
-        ( RNG_CONFIG_SELECTION_CNT > configSelection )    )
+    if( ( RNG_PERIPH_CNT           > rngId                                      ) &&
+        ( RNG_CONFIG_SELECTION_CNT > configSelection                            ) &&
+        ( RNG_FUNCTION_ACTIVE     == rng_ConfigList[ configSelection ].Supported )    )
     {
-        MODIFY_REG( rng_PeriphConf[ rngId ].RngReg->CR,
-                    RNG_CR_CONDRST | RNG_CR_RNG_CONFIG1 | RNG_CR_CLKDIV | RNG_CR_RNG_CONFIG2 |
-                    RNG_CR_NISTC   | RNG_CR_RNG_CONFIG3 | RNG_CR_CED ,
-                    rng_ConfigList[ configSelection ].CrRegVal | RNG_CR_CONDRST);
+        RNG_TypeDef * const            rngReg   = rng_PeriphConf[ rngId ].RngReg;
+        const rng_ConfigurationList_t *config   = &rng_ConfigList[ configSelection ];
+        const uint32_t                 lockState = LL_RNG_IsConfigLocked( rngReg );
 
-        CLEAR_BIT ( rng_PeriphConf[ rngId ].RngReg->CR, RNG_CR_CONDRST );
+        if( RNG_LL_STATE_INACTIVE == lockState )
+        {
+            /* Reference manual sequence: CONDRST with new CR values, NSCR, HTCR, CONDRST release */
+            MODIFY_REG( rngReg->CR, RNG_CR_CONFIG_MASK | RNG_CR_CONDRST, ( config->CrRegVal & RNG_CR_CONFIG_MASK ) | RNG_CR_CONDRST );
+            WRITE_REG ( rngReg->NSCR, config->NscrRegVal );
+            LL_RNG_SetHealthConfig( rngReg, config->HtcrRegVal );
+            LL_RNG_DisableCondReset( rngReg );
 
-        LL_RNG_SetNoiseConfig ( rng_PeriphConf[rngId].RngReg, rng_ConfigList[ configSelection ].NscrRegVal );
-        LL_RNG_SetHealthConfig( rng_PeriphConf[rngId].RngReg, rng_ConfigList[ configSelection ].HtcrRegVal );
+            retValue = Rng_Wait_RegState( rngId, LL_RNG_IsEnabledCondReset, RNG_LL_STATE_INACTIVE );
+
+            const uint32_t crConfig = READ_BIT( rngReg->CR, RNG_CR_CONFIG_MASK );
+            const uint32_t nscrVal  = READ_REG( rngReg->NSCR );
+            const uint32_t htcrVal  = LL_RNG_GetHealthConfig( rngReg );
+
+            if( ( RNG_REQUEST_OK                            == retValue ) &&
+                ( ( config->CrRegVal & RNG_CR_CONFIG_MASK ) == crConfig ) &&
+                ( config->NscrRegVal                        == nscrVal  ) &&
+                ( config->HtcrRegVal                        == htcrVal  )    )
+            {
+                retValue = RNG_REQUEST_OK;
+            }
+            else
+            {
+                /* Configuration has not been applied */
+                retValue = RNG_REQUEST_ERROR;
+            }
+        }
+        else
+        {
+            /* Configuration is locked until system reset */
+            retValue = RNG_REQUEST_ERROR;
+        }
     }
     else
     {
@@ -679,29 +869,16 @@ rng_RequestState_t Rng_Set_Configuration( rng_PeriphId_t rngId, rng_ConfigSelect
 /**
  * \brief Returns configuration of Random Number Generator (RNG) peripheral.
  *
- * The Random Number Generator (RNG) offers three configurations for the
- * conditioning component.
- * Each configuration is compliant with different standards and provides
- * different throughput and entropy rate on the output.
- * The configurations are:
+ * Configuration is identified by CR configuration bits, NSCR and HTCR values.
  *
- * - NIST SP800-90B compliant configuration:
- *   The conditioning component is based on a cryptographic hash function
- *   (SHA-256) and provides full entropy on the output (128-bit).
- *
- * - AIS-31 T0 to T8 compliant configuration - high speed
- *   The conditioning component is based on a linear feedback shift register
- *   (LFSR) and provides lower entropy on the output (128-bit).
- *
- * - AIS-31 T0 to T8 compliant configuration - high entropy
- *   The conditioning component is based on a cryptographic hash function
- *   (SHA-256) and provides full entropy on the output (128-bit).
+ * \note  On RNG version shared with STM32U5 the NIST and AIS-31 high entropy
+ *        configurations use the same register values, NIST is reported.
  *
  * \param rngId           [in] : RNG peripheral ID
- * \param configSelection [out]: Pointer where configuration selection will be stored
+ * \param configSelection [out]: Pointer where configuration selection will be stored. Must not be NULL.
  *
- * \return State of request execution. Returns "OK" if request was success,
- *         otherwise return error.
+ * \return Returns \ref RNG_REQUEST_OK if the register values match one of the
+ *         supported configurations. Otherwise returns \ref RNG_REQUEST_ERROR.
  */
 rng_RequestState_t Rng_Get_Configuration( rng_PeriphId_t rngId, rng_ConfigSelection_t * const configSelection )
 {
@@ -710,28 +887,26 @@ rng_RequestState_t Rng_Get_Configuration( rng_PeriphId_t rngId, rng_ConfigSelect
     if( ( RNG_PERIPH_CNT > rngId           ) &&
         ( RNG_NULL_PTR  != configSelection )    )
     {
-        uint32_t crRegVal = READ_REG( rng_PeriphConf[ rngId ].RngReg->CR );
-        crRegVal = crRegVal & ( RNG_CR_RNG_CONFIG1 | RNG_CR_CLKDIV      | RNG_CR_RNG_CONFIG2 |
-                                RNG_CR_NISTC       | RNG_CR_RNG_CONFIG3 | RNG_CR_CED );
+        const RNG_TypeDef * const rngReg  = rng_PeriphConf[ rngId ].RngReg;
+        const uint32_t            crVal   = READ_BIT( rngReg->CR, RNG_CR_CONFIG_MASK );
+        const uint32_t            nscrVal = READ_REG( rngReg->NSCR );
+        const uint32_t            htcrVal = LL_RNG_GetHealthConfig( rngReg );
 
-        uint32_t nscrRegVal = LL_RNG_GetNoiseConfig ( rng_PeriphConf[rngId].RngReg );
-        uint32_t htcrRegVal = LL_RNG_GetHealthConfig( rng_PeriphConf[rngId].RngReg );
-
-        for( uint32_t index = 0u; RNG_CONFIG_SELECTION_CNT > index; index++ )
+        for( rng_ConfigSelection_t searchId = RNG_CONFIG_SELECTION_NIST; RNG_CONFIG_SELECTION_CNT > searchId; searchId ++ )
         {
-            if( ( crRegVal   == rng_ConfigList[ index ].CrRegVal   ) &&
-                ( nscrRegVal == rng_ConfigList[ index ].NscrRegVal ) &&
-                ( htcrRegVal == rng_ConfigList[ index ].HtcrRegVal )    )
+            if( ( RNG_FUNCTION_ACTIVE                              == rng_ConfigList[ searchId ].Supported  ) &&
+                ( ( rng_ConfigList[ searchId ].CrRegVal & RNG_CR_CONFIG_MASK ) == crVal                     ) &&
+                ( rng_ConfigList[ searchId ].NscrRegVal            == nscrVal                               ) &&
+                ( rng_ConfigList[ searchId ].HtcrRegVal            == htcrVal                               )    )
             {
-                *configSelection = rng_ConfigList[ index ].ConfigSelection;
+                *configSelection = searchId;
 
                 retValue = RNG_REQUEST_OK;
-
                 break;
             }
             else
             {
-                /* Keep return value as error */
+                /* Unknown configuration, keep return state as error */
                 retValue = RNG_REQUEST_ERROR;
             }
         }
@@ -753,7 +928,7 @@ rng_RequestState_t Rng_Get_Configuration( rng_PeriphId_t rngId, rng_ConfigSelect
  * register.
  *
  * \param rngId [in] : RNG peripheral ID
- * \param state [out]: Pointer to state of data ready flag
+ * \param state [out]: Pointer to state of data ready flag. Must not be NULL.
  *
  * \return State of request execution. Returns "OK" if request was success,
  *         otherwise return error.
@@ -765,9 +940,9 @@ rng_RequestState_t Rng_Get_DataReadyState( rng_PeriphId_t rngId, rng_FunctionSta
     if( ( RNG_PERIPH_CNT > rngId ) &&
         ( RNG_NULL_PTR  != state )    )
     {
-        uint32_t regValue = LL_RNG_IsActiveFlag_DRDY( rng_PeriphConf[ rngId ].RngReg );
+        const uint32_t regValue = LL_RNG_IsActiveFlag_DRDY( rng_PeriphConf[ rngId ].RngReg );
 
-        if( 0u != regValue )
+        if( RNG_LL_STATE_ACTIVE == regValue )
         {
             *state = RNG_FUNCTION_ACTIVE;
         }
@@ -790,42 +965,41 @@ rng_RequestState_t Rng_Get_DataReadyState( rng_PeriphId_t rngId, rng_FunctionSta
 /**
  * \brief Returns error mask of Random Number Generator (RNG) peripheral.
  *
+ * Error mask is created from error interrupt status flags (SEIS, CEIS).
+ *
  * \param rngId   [in] : RNG peripheral ID
- * \param errMask [out]: Pointer to error mask
+ * \param errMask [out]: Pointer to error mask. Must not be NULL.
  *
  * \return State of request execution. Returns "OK" if request was success,
  *         otherwise return error.
  */
 rng_RequestState_t Rng_Get_Error( rng_PeriphId_t rngId, rng_Error_t * const errMask )
 {
-    rng_RequestState_t retValue     = RNG_REQUEST_ERROR;
-    rng_Error_t        localErrMask = RNG_ERROR_NONE;
+    rng_RequestState_t retValue = RNG_REQUEST_ERROR;
 
-    if( ( RNG_PERIPH_CNT > rngId  ) &&
-        ( RNG_NULL_PTR != errMask )    )
+    if( ( RNG_PERIPH_CNT > rngId   ) &&
+        ( RNG_NULL_PTR  != errMask )    )
     {
-        uint32_t errFlagCeis = LL_RNG_IsActiveFlag_CEIS( rng_PeriphConf[ rngId ].RngReg );
-        uint32_t errFlagSeis = LL_RNG_IsActiveFlag_SEIS( rng_PeriphConf[ rngId ].RngReg );
+        const uint32_t seedErr  = LL_RNG_IsActiveFlag_SEIS( rng_PeriphConf[ rngId ].RngReg );
+        const uint32_t clockErr = LL_RNG_IsActiveFlag_CEIS( rng_PeriphConf[ rngId ].RngReg );
 
-        if( ( 0u != errFlagCeis ) &&
-            ( 0u != errFlagSeis )    )
+        if( ( RNG_LL_STATE_ACTIVE == seedErr  ) &&
+            ( RNG_LL_STATE_ACTIVE == clockErr )    )
         {
-            localErrMask = RNG_ERROR_ALL;
+            *errMask = RNG_ERROR_ALL;
         }
-        else if( 0u != errFlagCeis )
+        else if( RNG_LL_STATE_ACTIVE == seedErr )
         {
-            localErrMask = RNG_ERROR_CLOCK_ERR;
+            *errMask = RNG_ERROR_SEED_ERR;
         }
-        else if( 0u != errFlagSeis )
+        else if( RNG_LL_STATE_ACTIVE == clockErr )
         {
-            localErrMask = RNG_ERROR_SEED_ERR;
+            *errMask = RNG_ERROR_CLOCK_ERR;
         }
         else
         {
-            localErrMask = RNG_ERROR_NONE;
+            *errMask = RNG_ERROR_NONE;
         }
-
-        *errMask = localErrMask;
 
         retValue = RNG_REQUEST_OK;
     }
@@ -841,31 +1015,89 @@ rng_RequestState_t Rng_Get_Error( rng_PeriphId_t rngId, rng_Error_t * const errM
 /**
  * \brief Clears error flags of Random Number Generator (RNG) peripheral.
  *
+ * Seed error: if the seed error is still active (SECS) and auto reset is
+ * disabled, the conditioning logic is reset first (reference manual recovery
+ * sequence), then SEIS is cleared. With auto reset enabled the hardware
+ * recovers by itself.
+ *
  * \param rngId   [in]: RNG peripheral ID
  * \param errMask [in]: Error mask to be cleared
  *
- * \return State of request execution. Returns "OK" if request was success,
- *         otherwise return error.
+ * \return Returns \ref RNG_REQUEST_OK if requested flags read back cleared.
+ *         Otherwise returns \ref RNG_REQUEST_ERROR (eg. the error is still present).
  */
 rng_RequestState_t Rng_Clear_Error( rng_PeriphId_t rngId, rng_Error_t errMask )
 {
     rng_RequestState_t retValue = RNG_REQUEST_ERROR;
 
-    if( RNG_PERIPH_CNT > rngId )
+    if( ( RNG_PERIPH_CNT > rngId   ) &&
+        ( RNG_ERROR_CNT  > errMask )    )
     {
-        if( ( RNG_ERROR_CLOCK_ERR == errMask ) ||
-            ( RNG_ERROR_ALL       == errMask )    )
-        {
-            LL_RNG_ClearFlag_CEIS( rng_PeriphConf[ rngId ].RngReg );
-        }
-
-        if( ( RNG_ERROR_SEED_ERR == errMask ) ||
-            ( RNG_ERROR_ALL      == errMask )    )
-        {
-            LL_RNG_ClearFlag_SEIS( rng_PeriphConf[ rngId ].RngReg );
-        }
+        RNG_TypeDef * const rngReg = rng_PeriphConf[ rngId ].RngReg;
 
         retValue = RNG_REQUEST_OK;
+
+        if( 0u != ( (uint32_t)errMask & (uint32_t)RNG_ERROR_CLOCK_ERR ) )
+        {
+            LL_RNG_ClearFlag_CEIS( rngReg );
+
+            const uint32_t clkErrState = LL_RNG_IsActiveFlag_CEIS( rngReg );
+
+            if( RNG_LL_STATE_ACTIVE == clkErrState )
+            {
+                retValue = RNG_REQUEST_ERROR;
+            }
+            else
+            {
+                /* Clock error flag cleared */
+            }
+        }
+        else
+        {
+            /* Clock error is not requested */
+        }
+
+        if( 0u != ( (uint32_t)errMask & (uint32_t)RNG_ERROR_SEED_ERR ) )
+        {
+            const uint32_t seedErrCurrent = LL_RNG_IsActiveFlag_SECS( rngReg );
+            const uint32_t autoResetOff   = LL_RNG_IsEnabledArdis( rngReg );
+
+            if( ( RNG_LL_STATE_ACTIVE   == seedErrCurrent ) &&
+                ( RNG_LL_STATE_INACTIVE == autoResetOff   )    )
+            {
+                const rng_RequestState_t condRstState = Rng_Set_CondReset( rngId );
+
+                if( RNG_REQUEST_OK != condRstState )
+                {
+                    retValue = RNG_REQUEST_ERROR;
+                }
+                else
+                {
+                    /* Conditioning logic reset done */
+                }
+            }
+            else
+            {
+                /* Seed error is not active or auto reset is enabled */
+            }
+
+            LL_RNG_ClearFlag_SEIS( rngReg );
+
+            const uint32_t seedErrState = LL_RNG_IsActiveFlag_SEIS( rngReg );
+
+            if( RNG_LL_STATE_ACTIVE == seedErrState )
+            {
+                retValue = RNG_REQUEST_ERROR;
+            }
+            else
+            {
+                /* Seed error flag cleared */
+            }
+        }
+        else
+        {
+            /* Seed error is not requested */
+        }
     }
     else
     {
@@ -882,7 +1114,7 @@ rng_RequestState_t Rng_Clear_Error( rng_PeriphId_t rngId, rng_Error_t errMask )
  * When clock error detection is enabled, the RNG checks that the clock
  * frequency is within the allowed range. If a clock error is detected,
  * the CEIS bit in the SR register is set and an interrupt is generated if
- * the CEIE bit in the CR register is set.
+ * the IE bit in the CR register is set.
  *
  * \note When the clock error detection is activated, the RNG clock frequency
  *       before the internal divider must be higher than the AHB clock frequency
@@ -901,21 +1133,7 @@ rng_RequestState_t Rng_Set_ClockErrorDetectActive( rng_PeriphId_t rngId )
     {
         LL_RNG_EnableClkErrorDetect( rng_PeriphConf[ rngId ].RngReg );
 
-        for( uint32_t iterationCnt = 0u; RNG_TIMEOUT_RAW > iterationCnt; iterationCnt++ )
-        {
-            uint32_t regValue = LL_RNG_IsEnabledClkErrorDetect( rng_PeriphConf[ rngId ].RngReg );
-
-            if (0u != regValue)
-            {
-                retValue = RNG_REQUEST_OK;
-                break;
-            }
-            else
-            {
-                /* Clock source has not yet been changed, keep return state as error */
-                retValue = RNG_REQUEST_ERROR;
-            }
-        }
+        retValue = Rng_Wait_RegState( rngId, LL_RNG_IsEnabledClkErrorDetect, RNG_LL_STATE_ACTIVE );
     }
     else
     {
@@ -933,6 +1151,7 @@ rng_RequestState_t Rng_Set_ClockErrorDetectActive( rng_PeriphId_t rngId )
  * clock frequency is within the allowed range.
  *
  * \param rngId [in]: RNG peripheral ID
+ *
  * \return State of request execution. Returns "OK" if request was success,
  *         otherwise return error.
  */
@@ -942,23 +1161,9 @@ rng_RequestState_t Rng_Set_ClockErrorDetectInactive( rng_PeriphId_t rngId )
 
     if( RNG_PERIPH_CNT > rngId )
     {
-        LL_RNG_DisableClkErrorDetect( rng_PeriphConf[rngId].RngReg );
+        LL_RNG_DisableClkErrorDetect( rng_PeriphConf[ rngId ].RngReg );
 
-        for( uint32_t iterationCnt = 0u; RNG_TIMEOUT_RAW > iterationCnt; iterationCnt++ )
-        {
-            uint32_t regValue = LL_RNG_IsEnabledClkErrorDetect( rng_PeriphConf[ rngId ].RngReg );
-
-            if( 0u == regValue )
-            {
-                retValue = RNG_REQUEST_OK;
-                break;
-            }
-            else
-            {
-                /* Clock source has not yet been changed, keep return state as error */
-                retValue = RNG_REQUEST_ERROR;
-            }
-        }
+        retValue = Rng_Wait_RegState( rngId, LL_RNG_IsEnabledClkErrorDetect, RNG_LL_STATE_INACTIVE );
     }
     else
     {
@@ -973,7 +1178,7 @@ rng_RequestState_t Rng_Set_ClockErrorDetectInactive( rng_PeriphId_t rngId )
  * \brief Returns state of clock error detection functionality.
  *
  * \param rngId [in] : RNG peripheral ID
- * \param state [out]: Pointer to state of clock error detection functionality
+ * \param state [out]: Pointer to state of clock error detection functionality. Must not be NULL.
  *
  * \return State of request execution. Returns "OK" if request was success,
  *         otherwise return error.
@@ -985,9 +1190,9 @@ rng_RequestState_t Rng_Get_ClockErrorDetectState( rng_PeriphId_t rngId, rng_Func
     if( ( RNG_PERIPH_CNT > rngId ) &&
         ( RNG_NULL_PTR  != state )    )
     {
-        uint32_t regValue = LL_RNG_IsEnabledClkErrorDetect( rng_PeriphConf[ rngId ].RngReg );
+        const uint32_t regValue = LL_RNG_IsEnabledClkErrorDetect( rng_PeriphConf[ rngId ].RngReg );
 
-        if( 0u != regValue )
+        if( RNG_LL_STATE_ACTIVE == regValue )
         {
             *state = RNG_FUNCTION_ACTIVE;
         }
@@ -1008,30 +1213,15 @@ rng_RequestState_t Rng_Get_ClockErrorDetectState( rng_PeriphId_t rngId, rng_Func
 
 
 /**
- * \brief Activates auto reset functionality.
- *
- * \note Keeping the auto-reset enabled (automatic clearance of the SECS bit)
- *       simplifies the management of noise source errors.
+ * \brief Activates auto reset functionality (ARDIS = 0).
  *
  * When a noise source (or seed) error occurs, the RNG stops generating random
- * numbers and sets to 1 both SEIS and SECS bits to indicate that a seed error
- * occurred. If a value is available in the RNG_DR register, it must not be used
- * as it may not have enough entropy.
- * When auto-reset is enabled, it clear the SEIS interrupt status bit in the
- * RNG_SR register before drawing random numbers again.
- * When ARDIS is set (auto-reset disabled) the following sequence must be used
- * to fully recover from a seed error:
- * 1. Write CONDRST at 1 and at 0 in the RNG_CR register to reset the
- *    conditioning logic.
- * 2. Wait for the CONDRST bit to be cleared by hardware. Then clear the SEIS
- *    interrupt status bit in the RNG_SR register.
- * 3. If SECS is still set in RNG_SR it means a new seed error occurred
- *    (unlikely). In this case go back to step 1.
+ * numbers and sets both SEIS and SECS bits. With auto reset enabled the
+ * hardware clears SECS and restarts the generation automatically, application
+ * only clears SEIS (\ref Rng_Clear_Error).
  *
- * \note After a seed error RNG restarts generating random numbers when SECS is
- *       cleared.
- *
- * \note Activation this function is ignored if configuration lock is active.
+ * \note  Keeping the auto reset enabled simplifies the management of noise
+ *        source errors.
  *
  * \param rngId [in]: RNG peripheral ID
  *
@@ -1046,21 +1236,7 @@ rng_RequestState_t Rng_Set_AutoResetActive( rng_PeriphId_t rngId )
     {
         LL_RNG_EnableArdis( rng_PeriphConf[ rngId ].RngReg );
 
-        for( uint32_t iterationCnt = 0u; RNG_TIMEOUT_RAW > iterationCnt; iterationCnt++ )
-        {
-            uint32_t regValue = LL_RNG_IsEnabledArdis( rng_PeriphConf[ rngId ].RngReg );
-
-            if( 0u != regValue )
-            {
-                retValue = RNG_REQUEST_OK;
-                break;
-            }
-            else
-            {
-                /* Clock source has not yet been changed, keep return state as error */
-                retValue = RNG_REQUEST_ERROR;
-            }
-        }
+        retValue = Rng_Wait_RegState( rngId, LL_RNG_IsEnabledArdis, RNG_LL_STATE_ACTIVE );
     }
     else
     {
@@ -1072,12 +1248,13 @@ rng_RequestState_t Rng_Set_AutoResetActive( rng_PeriphId_t rngId )
 
 
 /**
- * \brief Deactivates seed error detection functionality.
+ * \brief Deactivates auto reset functionality (ARDIS = 1).
  *
- * When seed error detection is disabled, the RNG does not check that
- * the seed value is not all zeros.
+ * After seed error the conditioning logic has to be reset by software,
+ * \ref Rng_Clear_Error performs the recovery sequence.
  *
  * \param rngId [in]: RNG peripheral ID
+ *
  * \return State of request execution. Returns "OK" if request was success,
  *         otherwise return error.
  */
@@ -1089,21 +1266,7 @@ rng_RequestState_t Rng_Set_AutoResetInactive( rng_PeriphId_t rngId )
     {
         LL_RNG_DisableArdis( rng_PeriphConf[ rngId ].RngReg );
 
-        for( uint32_t iterationCnt = 0u; RNG_TIMEOUT_RAW > iterationCnt; iterationCnt++ )
-        {
-            uint32_t regValue = LL_RNG_IsEnabledArdis( rng_PeriphConf[ rngId ].RngReg );
-
-            if( 0u == regValue )
-            {
-                retValue = RNG_REQUEST_OK;
-                break;
-            }
-            else
-            {
-                /* Clock source has not yet been changed, keep return state as error */
-                retValue = RNG_REQUEST_ERROR;
-            }
-        }
+        retValue = Rng_Wait_RegState( rngId, LL_RNG_IsEnabledArdis, RNG_LL_STATE_INACTIVE );
     }
     else
     {
@@ -1114,10 +1277,11 @@ rng_RequestState_t Rng_Set_AutoResetInactive( rng_PeriphId_t rngId )
 }
 
 
-/** * \brief Returns state of seed error detection functionality.
+/**
+ * \brief Returns state of auto reset functionality.
  *
- * \param rngId [in] : RNG peripheral ID
- * \param reqState [out]: Pointer to state of seed error detection functionality
+ * \param rngId     [in] : RNG peripheral ID
+ * \param reqState [out]: Pointer to state of auto reset functionality. Must not be NULL.
  *
  * \return State of request execution. Returns "OK" if request was success,
  *         otherwise return error.
@@ -1129,9 +1293,9 @@ rng_RequestState_t Rng_Get_AutoResetState( rng_PeriphId_t rngId, rng_FunctionSta
     if( ( RNG_PERIPH_CNT > rngId    ) &&
         ( RNG_NULL_PTR  != reqState )    )
     {
-        uint32_t regValue = LL_RNG_IsEnabledArdis( rng_PeriphConf[rngId].RngReg );
+        const uint32_t regValue = LL_RNG_IsEnabledArdis( rng_PeriphConf[ rngId ].RngReg );
 
-        if( 0u != regValue )
+        if( RNG_LL_STATE_ACTIVE == regValue )
         {
             *reqState = RNG_FUNCTION_ACTIVE;
         }
@@ -1152,9 +1316,14 @@ rng_RequestState_t Rng_Get_AutoResetState( rng_PeriphId_t rngId, rng_FunctionSta
 
 
 /**
- * \brief Sets clock source for Random Number Generator (RNG) peripheral.
+ * \brief Selects kernel clock source and activates the peripheral clock.
  *
- * \warning The clock source shall be 48MHz for NIST SP800-90B compliant.
+ * \warning The clock source shall be 48MHz for NIST SP800-90B compliance.
+ *
+ * \note  Internal oscillator (HSI48, HSI16) is started by RCC module.
+ * \note  Peripheral clock of the previous kernel clock source is released before
+ *        the new source is selected (RCC does not change the kernel clock
+ *        multiplexer of an active peripheral).
  *
  * \param rngId     [in]: RNG peripheral ID
  * \param clkSource [in]: Clock source
@@ -1164,39 +1333,57 @@ rng_RequestState_t Rng_Get_AutoResetState( rng_PeriphId_t rngId, rng_FunctionSta
  */
 rng_RequestState_t Rng_Set_ClkSource( rng_PeriphId_t rngId, rng_ClkSource_t clkSource )
 {
-    rng_RequestState_t retValue  = RNG_REQUEST_ERROR;
-    rcc_RequestState_t rccState  = RCC_REQUEST_ERROR;
+    rng_RequestState_t retValue = RNG_REQUEST_ERROR;
 
     if( ( RNG_PERIPH_CNT     > rngId     ) &&
         ( RNG_CLK_SOURCE_CNT > clkSource )    )
     {
-        if( RNG_CLK_SOURCE_HSI48 == clkSource )
+        const rcc_PeriphId_t prevRcc  = rng_RuntimeData[ rngId ].RngRcc;
+        const rcc_PeriphId_t newRcc   = rng_ClkSourceLut[ clkSource ];
+        rcc_RequestState_t   rccState = RCC_REQUEST_OK;
+
+        /* Peripheral clock of the previous source is released - RCC does not change
+         * the kernel clock multiplexer of an active peripheral */
+        if( prevRcc != newRcc )
         {
-            rccState = Rcc_Set_PeriphActive( RCC_PERIPH_RNG_HSI48 );
-        }
-        else if( RNG_CLK_SOURCE_HSI48_DIV2 == clkSource )
-        {
-            rccState = Rcc_Set_PeriphActive( RCC_PERIPH_RNG_HSI48_DIV2 );
-        }
-        else if( RNG_CLK_SOURCE_HSI16 == clkSource )
-        {
-            rccState = Rcc_Set_PeriphActive( RCC_PERIPH_RNG_HSI16 );
+            rcc_FunctionState_t prevState = RCC_FUNCTION_INACTIVE;
+
+            rccState = Rcc_Get_PeriphState( prevRcc, &prevState );
+
+            if( ( RCC_REQUEST_OK      == rccState  ) &&
+                ( RCC_FUNCTION_ACTIVE == prevState )    )
+            {
+                rccState = Rcc_Set_PeriphInactive( prevRcc );
+            }
+            else
+            {
+                /* Peripheral clock is not active or its state is not available */
+            }
         }
         else
         {
-            /* None of the supported clock sources was selected.
-             * User will handle it by himself. */
-            retValue = RNG_REQUEST_ERROR;
+            /* Same source - nothing to release */
         }
 
-        if( RCC_REQUEST_ERROR == rccState )
+        if( RCC_REQUEST_OK == rccState )
+        {
+            rccState = Rcc_Set_PeriphActive( newRcc );
+        }
+        else
+        {
+            /* Clock of the previous source not released */
+        }
+
+        if( RCC_REQUEST_OK == rccState )
+        {
+            rng_RuntimeData[ rngId ].RngRcc = rng_ClkSourceLut[ clkSource ];
+
+            retValue = RNG_REQUEST_OK;
+        }
+        else
         {
             /* Clock was not successfully activated */
             retValue = RNG_REQUEST_ERROR;
-        }
-        else
-        {
-            retValue = RNG_REQUEST_OK;
         }
     }
     else
@@ -1211,11 +1398,10 @@ rng_RequestState_t Rng_Set_ClkSource( rng_PeriphId_t rngId, rng_ClkSource_t clkS
 /**
  * \brief Configures clock divider for Random Number Generator (RNG) peripheral.
  *
- * \warning The clock divider shall not be changed for NIST SP800-90B compliant.
+ * \warning The clock divider shall not be changed for NIST SP800-90B compliance.
  *
  * \note The RNG clock frequency is divided by a programmable factor
- *      (1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384 or
- *      32768) before being used by the RNG.
+ *      (1, 2, 4, 8, ... 32768) before being used by the RNG.
  *
  * \param rngId      [in]: RNG peripheral ID
  * \param clkDivider [in]: Clock divider value
@@ -1226,16 +1412,15 @@ rng_RequestState_t Rng_Set_ClkSource( rng_PeriphId_t rngId, rng_ClkSource_t clkS
 rng_RequestState_t Rng_Set_ClkDivider( rng_PeriphId_t rngId, rng_ClkDivider_t clkDivider )
 {
     rng_RequestState_t retValue = RNG_REQUEST_ERROR;
-    uint32_t           regValue = 0u;
 
     if( ( RNG_PERIPH_CNT  > rngId      ) &&
         ( RNG_CLK_DIV_CNT > clkDivider )    )
     {
-        regValue = ( ( clkDivider << RNG_CR_CLKDIV_Pos ) & RNG_CR_CLKDIV_Msk );
+        const uint32_t regValue = ( (uint32_t)clkDivider << RNG_CR_CLKDIV_Pos ) & RNG_CR_CLKDIV_Msk;
 
         LL_RNG_SetClockDivider( rng_PeriphConf[ rngId ].RngReg, regValue );
 
-        retValue = RNG_REQUEST_OK;
+        retValue = Rng_Wait_RegState( rngId, LL_RNG_GetClockDivider, regValue );
     }
     else
     {
@@ -1250,7 +1435,7 @@ rng_RequestState_t Rng_Set_ClkDivider( rng_PeriphId_t rngId, rng_ClkDivider_t cl
  * \brief Returns value of clock divider for Random Number Generator (RNG) peripheral.
  *
  * \param rngId      [in] : RNG peripheral ID
- * \param clkDivider [out]: Pointer to clock divider value
+ * \param clkDivider [out]: Pointer to clock divider value. Must not be NULL.
  *
  * \return State of request execution. Returns "OK" if request was success,
  *         otherwise return error.
@@ -1258,14 +1443,13 @@ rng_RequestState_t Rng_Set_ClkDivider( rng_PeriphId_t rngId, rng_ClkDivider_t cl
 rng_RequestState_t Rng_Get_ClkDivider( rng_PeriphId_t rngId, rng_ClkDivider_t * const clkDivider )
 {
     rng_RequestState_t retValue = RNG_REQUEST_ERROR;
-    uint32_t           regValue = 0u;
 
     if( ( RNG_PERIPH_CNT > rngId      ) &&
         ( RNG_NULL_PTR  != clkDivider )    )
     {
-        regValue = LL_RNG_GetClockDivider( rng_PeriphConf[ rngId ].RngReg );
+        const uint32_t regValue = LL_RNG_GetClockDivider( rng_PeriphConf[ rngId ].RngReg );
 
-        *clkDivider = ( regValue >> RNG_CR_CLKDIV_Pos ) & RNG_CR_CLKDIV_Msk;
+        *clkDivider = (rng_ClkDivider_t)( regValue >> RNG_CR_CLKDIV_Pos );
 
         retValue = RNG_REQUEST_OK;
     }
@@ -1288,7 +1472,7 @@ rng_RequestState_t Rng_Get_ClkDivider( rng_PeriphId_t rngId, rng_ClkDivider_t * 
  * The generated random data is passed as parameter to the callback function.
  *
  * \param rngId    [in]: RNG peripheral ID
- * \param callback [in]: Pointer to interrupt callback
+ * \param callback [in]: Pointer to callback, can be NULL
  *
  * \return State of request execution. Returns "OK" if request was success,
  *         otherwise return error.
@@ -1315,13 +1499,8 @@ rng_RequestState_t Rng_Set_DataRdyCallback( rng_PeriphId_t rngId, rng_DataRdyCal
 /**
  * \brief Returns data ready callback.
  *
- * This callback is called when new random data is ready to be read from
- * output register. The callback function is common for blocking and
- * interrupt transfer styles.
- * The generated random data is passed as parameter to the callback function.
- *
  * \param rngId    [in] : RNG peripheral ID
- * \param callback [out]: Pointer to interrupt callback
+ * \param callback [out]: Pointer to store callback pointer. Must not be NULL.
  *
  * \return State of request execution. Returns "OK" if request was success,
  *         otherwise return error.
@@ -1330,7 +1509,8 @@ rng_RequestState_t Rng_Get_DataRdyCallback( rng_PeriphId_t rngId, rng_DataRdyCal
 {
     rng_RequestState_t retValue = RNG_REQUEST_ERROR;
 
-    if( RNG_PERIPH_CNT > rngId )
+    if( ( RNG_PERIPH_CNT > rngId    ) &&
+        ( RNG_NULL_PTR  != callback )    )
     {
         *callback = rng_RuntimeData[ rngId ].DataRdyCallback;
 
@@ -1353,7 +1533,7 @@ rng_RequestState_t Rng_Get_DataRdyCallback( rng_PeriphId_t rngId, rng_DataRdyCal
  * The error identification is passed as parameter to the callback function.
  *
  * \param rngId    [in]: RNG peripheral ID
- * \param callback [in]: Pointer to interrupt callback
+ * \param callback [in]: Pointer to callback, can be NULL
  *
  * \return State of request execution. Returns "OK" if request was success,
  *         otherwise return error.
@@ -1380,12 +1560,8 @@ rng_RequestState_t Rng_Set_ErrorCallback( rng_PeriphId_t rngId, rng_ErrCallback_
 /**
  * \brief Returns error callback
  *
- * This callback is called when error is detected. The callback function
- * is common for blocking and interrupt transfer styles.
- * The error identification is passed as parameter to the callback function.
- *
  * \param rngId    [in] : RNG peripheral ID
- * \param callback [out]: Pointer to interrupt callback
+ * \param callback [out]: Pointer to store callback pointer. Must not be NULL.
  *
  * \return State of request execution. Returns "OK" if request was success,
  *         otherwise return error.
@@ -1394,7 +1570,8 @@ rng_RequestState_t Rng_Get_ErrorCallback( rng_PeriphId_t rngId, rng_ErrCallback_
 {
     rng_RequestState_t retValue = RNG_REQUEST_ERROR;
 
-    if( RNG_PERIPH_CNT > rngId )
+    if( ( RNG_PERIPH_CNT > rngId    ) &&
+        ( RNG_NULL_PTR  != callback )    )
     {
         *callback = rng_RuntimeData[ rngId ].ErrorCallback;
 
@@ -1416,49 +1593,40 @@ rng_RequestState_t Rng_Get_ErrorCallback( rng_PeriphId_t rngId, rng_ErrCallback_
  *        and configures Interrupt Service Routine (ISR).
  *
  * Activation of global interrupt request is necessary for active any of
- * peripheral interrupt triggers (like DRDY, SECS, CEIS ).
+ * peripheral interrupt triggers (DRDY, SEIS, CEIS).
  *
  * \param rngId [in]: RNG peripheral ID
+ *
  * \return State of request execution. Returns "OK" if request was success,
  *         otherwise return error.
  */
 rng_RequestState_t Rng_Set_IrqActive( rng_PeriphId_t rngId )
 {
-    rng_RequestState_t  retState               = RNG_REQUEST_ERROR;
-    nvic_RequestState_t nvicActivationState    = NVIC_REQUEST_ERROR;
-    nvic_RequestState_t nvicHandlerConfigState = NVIC_REQUEST_ERROR;
+    rng_RequestState_t retState = RNG_REQUEST_ERROR;
 
     if( RNG_PERIPH_CNT > rngId )
     {
-        nvicHandlerConfigState = Nvic_Set_PeriphIrq_Handler( rng_PeriphConf[ rngId ].RngNvic,
-                                                             rng_PeriphConf[ rngId ].RngIsr );
+        nvic_RequestState_t nvicState = Nvic_Set_PeriphIrq_Handler( rng_PeriphConf[ rngId ].RngNvic,
+                                                                    rng_PeriphConf[ rngId ].RngIsr );
 
-        nvicActivationState = Nvic_Set_PeriphIrq_Active( rng_PeriphConf[ rngId ].RngNvic );
-
-        if( ( NVIC_REQUEST_OK != nvicActivationState    ) ||
-            ( NVIC_REQUEST_OK != nvicHandlerConfigState )    )
+        if( NVIC_REQUEST_OK == nvicState )
         {
-            retState  = RNG_REQUEST_ERROR;
+            nvicState = Nvic_Set_PeriphIrq_Active( rng_PeriphConf[ rngId ].RngNvic );
         }
         else
         {
+            /* Handler configuration failed */
+        }
+
+        if( NVIC_REQUEST_OK == nvicState )
+        {
             LL_RNG_EnableIT( rng_PeriphConf[ rngId ].RngReg );
 
-            for( uint32_t iterationCnt = 0u; RNG_TIMEOUT_RAW > iterationCnt; iterationCnt ++ )
-            {
-                uint32_t regValue  = LL_RNG_IsEnabledIT( rng_PeriphConf[ rngId ].RngReg );
-
-                if( 0u != regValue )
-                {
-                    retState = RNG_REQUEST_OK;
-                    break;
-                }
-                else
-                {
-                    /* Clock source has not yet been changed, keep return state as error */
-                    retState = RNG_REQUEST_ERROR;
-                }
-            }
+            retState = Rng_Wait_RegState( rngId, LL_RNG_IsEnabledIT, RNG_LL_STATE_ACTIVE );
+        }
+        else
+        {
+            retState = RNG_REQUEST_ERROR;
         }
     }
     else
@@ -1471,45 +1639,32 @@ rng_RequestState_t Rng_Set_IrqActive( rng_PeriphId_t rngId )
 
 
 /**
- * \brief De-activates global Interrupt Requests (IRQ) for RNG peripheral
- *        and configures Interrupt Service Routine (ISR).
+ * \brief De-activates global Interrupt Requests (IRQ) for RNG peripheral.
  *
  * \param rngId [in]: RNG peripheral ID
+ *
  * \return State of request execution. Returns "OK" if request was success,
  *         otherwise return error.
  */
 rng_RequestState_t Rng_Set_IrqInactive( rng_PeriphId_t rngId )
 {
-    rng_RequestState_t  retState  = RNG_REQUEST_ERROR;
-    nvic_RequestState_t nvicState = NVIC_REQUEST_ERROR;
+    rng_RequestState_t retState = RNG_REQUEST_ERROR;
 
     if( RNG_PERIPH_CNT > rngId )
     {
-        nvicState = Nvic_Set_PeriphIrq_Inactive( rng_PeriphConf[ rngId ].RngNvic );
+        const nvic_RequestState_t nvicState = Nvic_Set_PeriphIrq_Inactive( rng_PeriphConf[ rngId ].RngNvic );
+
+        LL_RNG_DisableIT( rng_PeriphConf[ rngId ].RngReg );
+
+        retState = Rng_Wait_RegState( rngId, LL_RNG_IsEnabledIT, RNG_LL_STATE_INACTIVE );
 
         if( NVIC_REQUEST_OK != nvicState )
         {
-            retState  = RNG_REQUEST_ERROR;
+            retState = RNG_REQUEST_ERROR;
         }
         else
         {
-            LL_RNG_DisableIT( rng_PeriphConf[ rngId ].RngReg );
-
-            for( uint32_t iterationCnt = 0u; RNG_TIMEOUT_RAW > iterationCnt; iterationCnt ++ )
-            {
-                uint32_t regValue  = LL_RNG_IsEnabledIT( rng_PeriphConf[ rngId ].RngReg );
-
-                if( 0u == regValue )
-                {
-                    retState = RNG_REQUEST_OK;
-                    break;
-                }
-                else
-                {
-                    /* Clock source has not yet been changed, keep return state as error */
-                    retState = RNG_REQUEST_ERROR;
-                }
-            }
+            /* Keep peripheral interrupt deactivation result */
         }
     }
     else
@@ -1528,7 +1683,8 @@ rng_RequestState_t Rng_Set_IrqInactive( rng_PeriphId_t rngId )
  *        in case of a error or data ready flag.
  *
  * \param rngId     [in]: RNG peripheral ID
- * \param reqState [out]: Activation state of peripheral interrupt request
+ * \param reqState [out]: Activation state of peripheral interrupt request. Must not be NULL.
+ *
  * \return State of request execution. Returns "OK" if request was success,
  *         otherwise return error.
  */
@@ -1536,12 +1692,12 @@ rng_RequestState_t Rng_Get_IrqState( rng_PeriphId_t rngId, rng_FunctionState_t *
 {
     rng_RequestState_t retValue = RNG_REQUEST_ERROR;
 
-    if( ( RNG_PERIPH_CNT       > rngId  ) &&
-        ( RNG_NULL_PTR != reqState )    )
+    if( ( RNG_PERIPH_CNT > rngId    ) &&
+        ( RNG_NULL_PTR  != reqState )    )
     {
-        uint32_t regValue = LL_RNG_IsEnabledIT( rng_PeriphConf[ rngId ].RngReg );
+        const uint32_t regValue = LL_RNG_IsEnabledIT( rng_PeriphConf[ rngId ].RngReg );
 
-        if( 0u != regValue )
+        if( RNG_LL_STATE_ACTIVE == regValue )
         {
             *reqState = RNG_FUNCTION_ACTIVE;
         }
@@ -1562,29 +1718,29 @@ rng_RequestState_t Rng_Get_IrqState( rng_PeriphId_t rngId, rng_FunctionState_t *
 
 
 /**
- * \brief Configures Interrupt Requests (IRQ) configured priority.
+ * \brief Configures Interrupt Requests (IRQ) priority.
  *
  * \param rngId   [in]: RNG peripheral ID
- * \param irqPrio [in]: Configured priority
+ * \param irqPrio [in]: Required priority (validated by NVIC module)
+ *
  * \return State of request execution. Returns "OK" if request was success,
  *         otherwise return error.
  */
 rng_RequestState_t Rng_Set_IrqPriority( rng_PeriphId_t rngId, rng_IrqPrio_t irqPrio )
 {
-    rng_RequestState_t retState  = RNG_REQUEST_ERROR;
-    nvic_RequestState_t    nvicState = NVIC_REQUEST_ERROR;
+    rng_RequestState_t retState = RNG_REQUEST_ERROR;
 
     if( RNG_PERIPH_CNT > rngId )
     {
-        nvicState = Nvic_Set_PeriphIrq_Prio( rng_PeriphConf[ rngId ].RngNvic, irqPrio );
+        const nvic_RequestState_t nvicState = Nvic_Set_PeriphIrq_Prio( rng_PeriphConf[ rngId ].RngNvic, irqPrio );
 
-        if( NVIC_REQUEST_OK != nvicState )
+        if( NVIC_REQUEST_OK == nvicState )
         {
-            retState  = RNG_REQUEST_ERROR;
+            retState = RNG_REQUEST_OK;
         }
         else
         {
-            retState  = RNG_REQUEST_OK;
+            retState = RNG_REQUEST_ERROR;
         }
     }
     else
@@ -1600,27 +1756,27 @@ rng_RequestState_t Rng_Set_IrqPriority( rng_PeriphId_t rngId, rng_IrqPrio_t irqP
  * \brief Reads Interrupt Requests (IRQ) configured priority.
  *
  * \param rngId    [in]: RNG peripheral ID
- * \param irqPrio [out]: Configured priority
+ * \param irqPrio [out]: Configured priority. Must not be NULL.
+ *
  * \return State of request execution. Returns "OK" if request was success,
  *         otherwise return error.
  */
 rng_RequestState_t Rng_Get_IrqPriority( rng_PeriphId_t rngId, rng_IrqPrio_t * const irqPrio )
 {
-    rng_RequestState_t  retState  = RNG_REQUEST_ERROR;
-    nvic_RequestState_t nvicState = NVIC_REQUEST_ERROR;
+    rng_RequestState_t retState = RNG_REQUEST_ERROR;
 
-    if( ( RNG_PERIPH_CNT  > rngId   ) &&
-        ( RNG_NULL_PTR   != irqPrio )    )
+    if( ( RNG_PERIPH_CNT > rngId   ) &&
+        ( RNG_NULL_PTR  != irqPrio )    )
     {
-        nvicState = Nvic_Get_PeriphIrq_Prio( rng_PeriphConf[ rngId ].RngNvic, irqPrio );
+        const nvic_RequestState_t nvicState = Nvic_Get_PeriphIrq_Prio( rng_PeriphConf[ rngId ].RngNvic, irqPrio );
 
-        if( NVIC_REQUEST_OK != nvicState )
+        if( NVIC_REQUEST_OK == nvicState )
         {
-            retState  = RNG_REQUEST_ERROR;
+            retState = RNG_REQUEST_OK;
         }
         else
         {
-            retState  = RNG_REQUEST_OK;
+            retState = RNG_REQUEST_ERROR;
         }
     }
     else
@@ -1633,51 +1789,113 @@ rng_RequestState_t Rng_Get_IrqPriority( rng_PeriphId_t rngId, rng_IrqPrio_t * co
 
 /* =========================== LOCAL FUNCTIONS ============================== */
 
+/**
+ * \brief Waits until register (bit field) reaches required value and no
+ *        conditioning soft reset is in progress.
+ *
+ * \param rngId    [in]: RNG peripheral ID, must be valid
+ * \param llGetter [in]: LL function returning checked register value
+ * \param reqValue [in]: Required value
+ *
+ * \return Returns \ref RNG_REQUEST_OK if the value was reached within timeout.
+ *         Otherwise returns \ref RNG_REQUEST_ERROR.
+ */
+static rng_RequestState_t Rng_Wait_RegState( rng_PeriphId_t rngId, rng_LlGetter_t llGetter, uint32_t reqValue )
+{
+    rng_RequestState_t retState = RNG_REQUEST_ERROR;
+
+    for( uint32_t iterationCnt = 0u; RNG_TIMEOUT_RAW > iterationCnt; iterationCnt ++ )
+    {
+        const uint32_t condRstState = LL_RNG_IsEnabledCondReset( rng_PeriphConf[ rngId ].RngReg );
+        const uint32_t regValue     = llGetter( rng_PeriphConf[ rngId ].RngReg );
+
+        if( ( RNG_LL_STATE_INACTIVE == condRstState ) &&
+            ( reqValue              == regValue     )    )
+        {
+            retState = RNG_REQUEST_OK;
+            break;
+        }
+        else
+        {
+            /* Register has not been updated yet */
+            retState = RNG_REQUEST_ERROR;
+        }
+    }
+
+    return ( retState );
+}
+
+
+/**
+ * \brief Resets conditioning logic (CONDRST 1 -> 0) and waits for completion.
+ *
+ * \param rngId [in]: RNG peripheral ID, must be valid
+ *
+ * \return Returns \ref RNG_REQUEST_OK if the reset finished within timeout.
+ *         Otherwise returns \ref RNG_REQUEST_ERROR.
+ */
+static rng_RequestState_t Rng_Set_CondReset( rng_PeriphId_t rngId )
+{
+    LL_RNG_EnableCondReset( rng_PeriphConf[ rngId ].RngReg );
+    LL_RNG_DisableCondReset( rng_PeriphConf[ rngId ].RngReg );
+
+    return ( Rng_Wait_RegState( rngId, LL_RNG_IsEnabledCondReset, RNG_LL_STATE_INACTIVE ) );
+}
 
 /* =========================== INTERRUPT HANDLERS =========================== */
 
 /**
- * \brief RNG Interrupt handler
+ * \brief RNG interrupt handler.
+ *
+ * Errors are cleared and reported by error callback (data are not read). Data
+ * ready: one block is read; it is reported by data ready callback only while
+ * the generation is running, otherwise it is discarded (FIFO drain).
  */
 static void Rng_IsrHandler( void )
 {
-    /*----------------------------- Error interrupt --------------------------*/
-    if( ( 0u != LL_RNG_IsActiveFlag_SEIS( rng_PeriphConf[ RNG_PERIPH_1 ].RngReg )  ) ||
-        ( 0u != LL_RNG_IsActiveFlag_CEIS( rng_PeriphConf[ RNG_PERIPH_1 ].RngReg )  )    )
+    const rng_PeriphId_t rngId   = RNG_PERIPH_1;
+    rng_Error_t          errMask = RNG_ERROR_NONE;
+
+    (void)Rng_Get_Error( rngId, &errMask );
+
+    const uint32_t dataRdyState = LL_RNG_IsActiveFlag_DRDY( rng_PeriphConf[ rngId ].RngReg );
+
+    if( RNG_ERROR_NONE != errMask )
     {
-        rng_Error_t errorBitMask = READ_BIT( rng_PeriphConf[ RNG_PERIPH_1 ].RngReg->SR, RNG_ERROR_ALL );
+        /*----------------------------- Error interrupt ----------------------*/
+        (void)Rng_Clear_Error( rngId, errMask );
 
-        LL_RNG_ClearFlag_CEIS( rng_PeriphConf[ RNG_PERIPH_1 ].RngReg );
-        LL_RNG_ClearFlag_SEIS( rng_PeriphConf[ RNG_PERIPH_1 ].RngReg );
-
-        if( RNG_NULL_PTR != rng_RuntimeData[ RNG_PERIPH_1 ].ErrorCallback )
+        if( RNG_NULL_PTR != rng_RuntimeData[ rngId ].ErrorCallback )
         {
-            rng_RuntimeData[ RNG_PERIPH_1 ].ErrorCallback( errorBitMask );
+            rng_RuntimeData[ rngId ].ErrorCallback( errMask );
         }
         else
         {
             /* Interrupt callback was not configured */
         }
     }
-
-    /*-------------------- Data ready (DRDY) interrupt -----------------------*/
-    if( 0u != LL_RNG_IsActiveFlag_DRDY( rng_PeriphConf[ RNG_PERIPH_1 ].RngReg ) )
+    else if( RNG_LL_STATE_ACTIVE == dataRdyState )
     {
-        rng_RandomData_t randData;
+        /*-------------------- Data ready (DRDY) interrupt -------------------*/
+        rng_RandomData_t         randData;
+        const rng_RequestState_t dataState = Rng_Get_Data( rngId, &randData );
 
-        (void)Rng_Get_Data( RNG_PERIPH_1, &randData );
-
-        if( RNG_NULL_PTR != rng_RuntimeData[ RNG_PERIPH_1 ].DataRdyCallback )
+        if( ( RNG_REQUEST_OK      == dataState                                ) &&
+            ( RNG_EXEC_STATE_BUSY == rng_RuntimeData[ rngId ].ExecState       ) &&
+            ( RNG_NULL_PTR        != rng_RuntimeData[ rngId ].DataRdyCallback )    )
         {
-            rng_RuntimeData[ RNG_PERIPH_1 ].DataRdyCallback( randData );
+            rng_RuntimeData[ rngId ].DataRdyCallback( randData );
         }
         else
         {
-            /* Interrupt callback was not configured */
+            /* Data are not valid, generation is not running or callback is not configured */
         }
+    }
+    else
+    {
+        /* No interrupt source is active */
     }
 }
-
 
 /* ================================ TASKS =================================== */
 

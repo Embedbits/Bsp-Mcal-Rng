@@ -1,4 +1,4 @@
-# Template version: 1.0.0
+# Template version: 0.0.1
 # Sets the version of CMakeLists.txt file.
 # Never, under any circumstances, change this line. It is used by
 # the module generation script to identify the template version.
@@ -25,19 +25,18 @@ set( Rng_SourceFiles
 # List of public header files provided by the current library
 set( Rng_PublicHeaders 
     Rng_Types.h
-    Rng_Port.h 
+    Rng_Port.h
 )
 
 
 # List of dependent libraries that are publicly used by the current library
 set( Rng_PublicDependentLibs
-    Ral_Lib 
+    Ral_Lib
 )
 
 
 # List of dependent libraries that are privately used by the current library
 set( Rng_PrivateDependentLibs
-    Ral_Lib
     Rcc_Lib
     Nvic_Lib
 )
@@ -81,10 +80,9 @@ target_include_directories( Rng_Lib
     PUBLIC
         $<BUILD_INTERFACE:${PUBLIC_HEADERS_DIR}>
         $<INSTALL_INTERFACE:include>
-        Rng_PublicIncludeDirs
+        ${Rng_PublicIncludeDirs}
     PRIVATE
-        ${Rng_IncludeDirs}
-        Rng_PrivateIncludeDirs
+        ${Rng_PrivateIncludeDirs}
 )
 
 
@@ -94,4 +92,14 @@ message(STATUS "Rng_Lib library created")
 #========================= Documentation configuration ========================#
 if(DOXYGEN_AVAILABLE STREQUAL "ON")
     Doxygen_AddPath("${CMAKE_CURRENT_SOURCE_DIR}/")
+endif()
+
+#========================= Unit tests configuration ===========================#
+if(UNIT_TESTING_AVAILABLE STREQUAL "ON")
+    UnitTesting_AddPath("${CMAKE_CURRENT_SOURCE_DIR}/Tests/UnitTests")
+endif()
+
+#===================== Integration tests configuration ========================#
+if(INTEGRATION_TESTING_AVAILABLE STREQUAL "ON")
+    IntegrationTesting_AddPath("${CMAKE_CURRENT_SOURCE_DIR}/Tests/IntegrationTests")
 endif()

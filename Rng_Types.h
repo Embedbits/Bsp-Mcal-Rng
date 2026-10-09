@@ -1,10 +1,15 @@
 /**
+ * \defgroup Rng Rng
+ * \brief Rng module
+ */
+
+/**
  * \author Mr.Nobody
  * \file Rng_Types.h
  * \ingroup Rng
  * \brief Rng module global types definition
  *
- * This file contains the types definitions used across the module and are 
+ * This file contains the types definitions used across the module and are
  * available for other modules through Port file.
  *
  */
@@ -13,12 +18,13 @@
 #define RNG_RNG_TYPES_H
 /* ============================== INCLUDES ================================== */
 #include "stdint.h"                         /* Module types definition        */
+#include "Stm32.h"                          /* MCU device header (RNG_CR_NIST_VALUE) */
 /* ========================== SYMBOLIC CONSTANTS ============================ */
 
 /** Null pointer definition */
 #define RNG_NULL_PTR                        ( ( void* ) 0u )
 
-/** Length of RNG data FIFO */
+/** Length of RNG data FIFO (one 128-bit conditioned block) */
 #define RNG_FIFO_LEN                        ( 4u )
 
 /* ========================== EXPORTED MACROS =============================== */
@@ -73,18 +79,22 @@ typedef enum
 /** \brief Peripheral identification */
 typedef enum
 {
-    RNG_PERIPH_1 = 0u,
-    RNG_PERIPH_CNT
+    RNG_PERIPH_1 = 0u, /**< Random number generator peripheral */
+    RNG_PERIPH_CNT     /**< Count of available peripherals     */
 }   rng_PeriphId_t;
 
 
-/** \brief Random Number Generator (RNG) clock source selection */
+/** \brief Random Number Generator (RNG) kernel clock source selection (RCC_CCIPR2.RNGSEL).
+ *
+ * \note  Internal oscillators (HSI48, HSI16) are started by RCC module when the
+ *        peripheral clock is activated.
+ */
 typedef enum
 {
-    RNG_CLK_SOURCE_HSI48 = 0u, /**< HSI48 clock source              */
-    RNG_CLK_SOURCE_HSI48_DIV2, /**< HSI48 divided by 2 clock source */
-    RNG_CLK_SOURCE_HSI16,      /**< HSI16 clock source              */
-    RNG_CLK_SOURCE_CNT         /**< Count of available options      */
+    RNG_CLK_SOURCE_HSI48 = 0u, /**< HSI48 clock source (48 MHz, NIST compliant) */
+    RNG_CLK_SOURCE_HSI48_DIV2, /**< HSI48 divided by 2 clock source (24 MHz)    */
+    RNG_CLK_SOURCE_HSI16,      /**< HSI16 clock source (16 MHz)                 */
+    RNG_CLK_SOURCE_CNT         /**< Count of available options                  */
 }   rng_ClkSource_t;
 
 
@@ -98,23 +108,23 @@ typedef enum
  */
 typedef enum
 {
-    RNG_CLK_DIV_1,     /**< Input clock is not divided      */
-    RNG_CLK_DIV_2,     /**< Input clock is divided by 2     */
-    RNG_CLK_DIV_4,     /**< Input clock is divided by 4     */
-    RNG_CLK_DIV_8,     /**< Input clock is divided by 8     */
-    RNG_CLK_DIV_16,    /**< Input clock is divided by 16    */
-    RNG_CLK_DIV_32,    /**< Input clock is divided by 32    */
-    RNG_CLK_DIV_64,    /**< Input clock is divided by 64    */
-    RNG_CLK_DIV_128,   /**< Input clock is divided by 128   */
-    RNG_CLK_DIV_256,   /**< Input clock is divided by 256   */
-    RNG_CLK_DIV_512,   /**< Input clock is divided by 512   */
-    RNG_CLK_DIV_1024,  /**< Input clock is divided by 1024  */
-    RNG_CLK_DIV_2048,  /**< Input clock is divided by 2048  */
-    RNG_CLK_DIV_4096,  /**< Input clock is divided by 4096  */
-    RNG_CLK_DIV_8192,  /**< Input clock is divided by 8192  */
-    RNG_CLK_DIV_16384, /**< Input clock is divided by 16384 */
-    RNG_CLK_DIV_32768, /**< Input clock is divided by 32768 */
-    RNG_CLK_DIV_CNT    /**< Count of available options      */
+    RNG_CLK_DIV_1 = 0u, /**< Input clock is not divided      */
+    RNG_CLK_DIV_2,      /**< Input clock is divided by 2     */
+    RNG_CLK_DIV_4,      /**< Input clock is divided by 4     */
+    RNG_CLK_DIV_8,      /**< Input clock is divided by 8     */
+    RNG_CLK_DIV_16,     /**< Input clock is divided by 16    */
+    RNG_CLK_DIV_32,     /**< Input clock is divided by 32    */
+    RNG_CLK_DIV_64,     /**< Input clock is divided by 64    */
+    RNG_CLK_DIV_128,    /**< Input clock is divided by 128   */
+    RNG_CLK_DIV_256,    /**< Input clock is divided by 256   */
+    RNG_CLK_DIV_512,    /**< Input clock is divided by 512   */
+    RNG_CLK_DIV_1024,   /**< Input clock is divided by 1024  */
+    RNG_CLK_DIV_2048,   /**< Input clock is divided by 2048  */
+    RNG_CLK_DIV_4096,   /**< Input clock is divided by 4096  */
+    RNG_CLK_DIV_8192,   /**< Input clock is divided by 8192  */
+    RNG_CLK_DIV_16384,  /**< Input clock is divided by 16384 */
+    RNG_CLK_DIV_32768,  /**< Input clock is divided by 32768 */
+    RNG_CLK_DIV_CNT     /**< Count of available options      */
 }   rng_ClkDivider_t;
 
 
@@ -128,17 +138,23 @@ typedef enum
  * The NIST SP800-90B target is full entropy on the output (128-bit).
  * Other configurations may be used when full entropy is not required or
  * when a higher throughput is needed.
+ *
+ * \note  AIS-31 configurations are in the list only on the STM32U5 device lines with the RNG NIST
+ *        configuration CR value 0x00F00D00 (STM32U575 / STM32U585, see AN4230), the other lines
+ *        have the NIST configuration only.
  */
 typedef enum
 {
     RNG_CONFIG_SELECTION_NIST = 0u,      /**< NIST SP800-90B compliant configuration                 */
+#if ( RNG_CR_NIST_VALUE == 0x00F00D00u )
     RNG_CONFIG_SELECTION_AIS_31_SPEED,   /**< AIS-31 T0 to T8 compliant configuration - high speed   */
     RNG_CONFIG_SELECTION_AIS_31_ENTROPY, /**< AIS-31 T0 to T8 compliant configuration - high entropy */
+#endif /* RNG_CR_NIST_VALUE */
     RNG_CONFIG_SELECTION_CNT             /**< Count of available options                             */
 }   rng_ConfigSelection_t;
 
 
-/** \brief List of random number generator peripheral errors */
+/** \brief List of random number generator peripheral errors (bit mask) */
 typedef enum
 {
     RNG_ERROR_NONE = 0u, /**< No active error mask          */
@@ -153,7 +169,7 @@ typedef enum
 typedef enum
 {
     RNG_TRANSFER_NONE = 0u, /**< No data transfer handling style is used. User must handle data transfer by himself. */
-    RNG_TRANSFER_BLOCKING , /**< Blocking style is used for data transfer.                                           */
+    RNG_TRANSFER_BLOCKING , /**< Blocking style is used for data transfer (data are polled by \ref Rng_Task).          */
     RNG_TRANSFER_INTERRUPT, /**< Interrupts are used for data transfer.                                              */
     RNG_TRANSFER_CNT        /**< Count of available options                                                          */
 }   rng_TransferStyle_t;
@@ -183,6 +199,7 @@ typedef void ( rng_DataRdyCallback_t )( rng_RandomData_t value );
 typedef void ( rng_ErrCallback_t )( rng_Error_t errMask );
 
 
+/** \brief Type used to store RNG configuration */
 typedef struct
 {
     rng_PeriphId_t        PeriphId;         /**< Peripheral identification                                  */

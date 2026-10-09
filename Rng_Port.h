@@ -4,7 +4,7 @@
  * \ingroup Rng
  * \brief Random Number Generator (RNG) module public functionality
  *
- * This file contains all available public functionality, any other files shall 
+ * This file contains all available public functionality, any other files shall not
  * be used outside of the module.
  *
  */
