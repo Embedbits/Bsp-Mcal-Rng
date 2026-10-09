@@ -15,6 +15,7 @@
 /* ============================= INCLUDES =================================== */
 #include "unity.h"                          /* Unity testing framework        */
 #include "RegMem.h"                         /* Register memory emulation      */
+#include "CmsisHost.h"                      /* Core intrinsics emulation      */
 #include "Rng_Port.h"                       /* Module under test              */
 #include "MockRcc_Port.h"                   /* RCC module mock                */
 #include "MockNvic_Port.h"                  /* NVIC module mock               */
@@ -785,6 +786,40 @@ void Ut_Rng_Isr_DataReady_CallsDataCallback( void )
     TEST_ASSERT_EQUAL_UINT32( 0u, utRng_ErrorCnt );
     TEST_ASSERT_EQUAL_HEX32( UT_RNG_DATA, utRng_LastData.value[ 0u ] );
     TEST_ASSERT_EQUAL_HEX32( UT_RNG_DATA, utRng_LastData.value[ RNG_FIFO_LEN - 1u ] );
+}
+
+
+/**
+ * \brief   RNG interrupt service routine ends with DSB.
+ *
+ * \details RNG running in interrupt mode, ISR called with data ready (data callback executed)
+ *          and without pending flag.
+ *
+ * \note    Device errata bug AB#670 (ES0182 2.1.3 "Store immediate overlapping exception return
+ *          operation might vector to incorrect interrupt", Arm ID 838869): a buffered store with
+ *          immediate offset still pending at the exception return may vector to an incorrect
+ *          interrupt. Workaround - DSB before the exception return of every handler.
+ *
+ * \par Expected results
+ * - Every ISR call executes exactly one DSB.
+ */
+void Ut_Rng_Isr_EndsWithDsb( void )
+{
+    Ut_Rng_Init_Running( RNG_TRANSFER_INTERRUPT );
+
+    uint32_t dsbCnt = CmsisHost_Get_InstrCnt( CMSISHOST_INSTR_DSB );
+
+    RNG->SR = RNG_SR_DRDY;
+    RNG->DR = UT_RNG_DATA;
+    utRng_Isr();
+    TEST_ASSERT_EQUAL_UINT32( dsbCnt + 1u, CmsisHost_Get_InstrCnt( CMSISHOST_INSTR_DSB ) );
+    TEST_ASSERT_EQUAL_UINT32( 1u, utRng_DataCnt );
+
+    dsbCnt = CmsisHost_Get_InstrCnt( CMSISHOST_INSTR_DSB );
+
+    RNG->SR = 0u;
+    utRng_Isr();
+    TEST_ASSERT_EQUAL_UINT32( dsbCnt + 1u, CmsisHost_Get_InstrCnt( CMSISHOST_INSTR_DSB ) );
 }
 
 

@@ -1709,6 +1709,7 @@ static void Rng_IsrHandler( void )
     {
         /* No interrupt source is active */
     }
+    __DSB();    /* Cortex-M4 erratum 838869: stores completed before the exception return */
 }
 
 /* ================================ TASKS =================================== */
