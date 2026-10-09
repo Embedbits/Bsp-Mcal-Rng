@@ -15,9 +15,9 @@ with a common public interface.
   is activated; LSE and PLL1 Q output shall be configured by the application. 48 MHz is required for NIST compliance.
 - **NIST configuration** uses device specific values from the CMSIS device header
   (`RNG_CR_NIST_VALUE`, `RNG_HTCR_NIST_VALUE`, `RNG_NSCR_NIST_VALUE`, see AN4230).
-- **AIS-31 configurations** are available only on devices with the RNG version shared with STM32U5
-  (STM32H503 / H523 / H533, `RNG_CR_NIST_VALUE == 0x00F00D00`). Other devices (STM32H56x / H57x, ...)
-  reject them by `Rng_Set_Configuration()`. On the STM32U5 RNG version the NIST and AIS-31 high entropy
+- **AIS-31 configurations** are in the list `rng_ConfigSelection_t` only on devices with the RNG version shared with STM32U5
+  (STM32H503 / H523 / H533, `RNG_CR_NIST_VALUE == 0x00F00D00`). The other devices (STM32H54x / H55x / H56x / H57x, ...)
+  have the NIST configuration only. On the STM32U5 RNG version the NIST and AIS-31 high entropy
   configurations use the same register values, `Rng_Get_Configuration()` reports NIST.
 - Every configuration change (CR config bits, CLKDIV, CED, ARDIS, NSCR, HTCR) is written with conditioning
   soft reset (CONDRST), the module waits for its completion and verifies the value by read-back.

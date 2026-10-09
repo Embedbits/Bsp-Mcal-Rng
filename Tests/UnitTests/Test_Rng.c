@@ -419,12 +419,12 @@ void Ut_Rng_Set_Configuration_KeepsControlBits( void )
 /**
  * \brief   Rng_Set_Configuration() handles AIS-31 configurations by RNG version.
  *
- * \details RNG version shared with STM32U5 (NIST CR value 0x00F00D00) supports
- *          AIS-31 configurations, other versions reject them.
+ * \details RNG version shared with STM32U5 (NIST CR value 0x00F00D00) has the
+ *          AIS-31 configurations in the list, other versions have the NIST configuration only.
  *
  * \par Expected results
- * - Supported: RNG_REQUEST_OK, AIS-31 high speed configuration read back.
- * - Not supported: RNG_REQUEST_ERROR, registers untouched.
+ * - Supported: 3 configurations in the list, RNG_REQUEST_OK, AIS-31 high speed configuration read back.
+ * - Not supported: 1 configuration (NIST) in the list, the registers are not touched.
  * - Invalid selection / ID: RNG_REQUEST_ERROR.
  */
 void Ut_Rng_Set_Configuration_Ais31_DependsOnRngVersion( void )
@@ -432,13 +432,13 @@ void Ut_Rng_Set_Configuration_Ais31_DependsOnRngVersion( void )
     rng_ConfigSelection_t selection = RNG_CONFIG_SELECTION_CNT;
 
 #if ( RNG_CR_NIST_VALUE == 0x00F00D00u )
+    TEST_ASSERT_EQUAL_UINT32( 3u, (uint32_t)RNG_CONFIG_SELECTION_CNT );
     TEST_ASSERT_EQUAL( RNG_REQUEST_OK, Rng_Set_Configuration( RNG_PERIPH_1, RNG_CONFIG_SELECTION_AIS_31_SPEED ) );
     TEST_ASSERT_EQUAL_HEX32( 0x01801000u, RNG->CR & UT_RNG_CR_CONFIG_MASK );
     TEST_ASSERT_EQUAL( RNG_REQUEST_OK, Rng_Get_Configuration( RNG_PERIPH_1, &selection ) );
     TEST_ASSERT_EQUAL( RNG_CONFIG_SELECTION_AIS_31_SPEED, selection );
 #else
-    TEST_ASSERT_EQUAL( RNG_REQUEST_ERROR, Rng_Set_Configuration( RNG_PERIPH_1, RNG_CONFIG_SELECTION_AIS_31_SPEED ) );
-    TEST_ASSERT_EQUAL( RNG_REQUEST_ERROR, Rng_Set_Configuration( RNG_PERIPH_1, RNG_CONFIG_SELECTION_AIS_31_ENTROPY ) );
+    TEST_ASSERT_EQUAL_UINT32( 1u, (uint32_t)RNG_CONFIG_SELECTION_CNT );
     TEST_ASSERT_EQUAL_HEX32( 0u, RNG->CR );
     TEST_ASSERT_EQUAL_HEX32( 0u, UT_RNG_HTCR );
     (void)selection;

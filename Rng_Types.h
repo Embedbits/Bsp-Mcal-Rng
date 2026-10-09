@@ -18,6 +18,7 @@
 #define RNG_RNG_TYPES_H
 /* ============================== INCLUDES ================================== */
 #include "stdint.h"                         /* Module types definition        */
+#include "Stm32.h"                          /* MCU device header (RNG_CR_NIST_VALUE) */
 /* ========================== SYMBOLIC CONSTANTS ============================ */
 
 /** Null pointer definition */
@@ -139,15 +140,17 @@ typedef enum
  * Other configurations may be used when full entropy is not required or
  * when a higher throughput is needed.
  *
- * \note  AIS-31 configurations are available only on devices with the same
- *        RNG version as STM32U5 (STM32H503, STM32H523, STM32H533). On other
- *        devices \ref Rng_Set_Configuration rejects them.
+ * \note  AIS-31 configurations are in the list only on the devices with the same
+ *        RNG version as STM32U5 (STM32H503, STM32H523, STM32H533), the other
+ *        devices have the NIST configuration only.
  */
 typedef enum
 {
     RNG_CONFIG_SELECTION_NIST = 0u,      /**< NIST SP800-90B compliant configuration                 */
+#if ( RNG_CR_NIST_VALUE == 0x00F00D00u )
     RNG_CONFIG_SELECTION_AIS_31_SPEED,   /**< AIS-31 T0 to T8 compliant configuration - high speed   */
     RNG_CONFIG_SELECTION_AIS_31_ENTROPY, /**< AIS-31 T0 to T8 compliant configuration - high entropy */
+#endif /* RNG_CR_NIST_VALUE */
     RNG_CONFIG_SELECTION_CNT             /**< Count of available options                             */
 }   rng_ConfigSelection_t;
 

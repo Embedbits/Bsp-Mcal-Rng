@@ -114,14 +114,6 @@ static void                 Rng_IsrHandler          ( void );
 #define RNG_NSCR_NIST_CONFIG            ( RNG_NSCR_RESET_VALUE )
 #endif /* RNG_NSCR_NIST_VALUE */
 
-#if ( RNG_CR_NIST_VALUE == 0x00F00D00u )
-/** RNG version shared with STM32U5 family - AIS-31 configurations are available */
-#define RNG_AIS31_SUPPORT               ( RNG_FUNCTION_ACTIVE )
-#else
-/** AIS-31 configuration values are not defined for this RNG version */
-#define RNG_AIS31_SUPPORT               ( RNG_FUNCTION_INACTIVE )
-#endif /* RNG_CR_NIST_VALUE */
-
 /** CR register value of AIS-31 high speed configuration (STM32U5 RNG version) */
 #define RNG_CR_AIS31_SPEED_VALUE        ( 0x01801000u )
 
@@ -160,8 +152,10 @@ _Static_assert( RNG_CLK_SOURCE_CNT == ( sizeof( rng_ClkSourceLut ) / sizeof( rcc
 static const rng_ConfigurationList_t rng_ConfigList[ ] =
 {
     { .Supported = RNG_FUNCTION_ACTIVE, .CrRegVal = RNG_CR_NIST_VALUE         , .HtcrRegVal = RNG_HTCR_NIST_VALUE , .NscrRegVal = RNG_NSCR_NIST_CONFIG }, /**< \ref RNG_CONFIG_SELECTION_NIST           */
-    { .Supported = RNG_AIS31_SUPPORT  , .CrRegVal = RNG_CR_AIS31_SPEED_VALUE  , .HtcrRegVal = RNG_HTCR_AIS31_VALUE, .NscrRegVal = RNG_NSCR_RESET_VALUE }, /**< \ref RNG_CONFIG_SELECTION_AIS_31_SPEED   */
-    { .Supported = RNG_AIS31_SUPPORT  , .CrRegVal = RNG_CR_AIS31_ENTROPY_VALUE, .HtcrRegVal = RNG_HTCR_AIS31_VALUE, .NscrRegVal = RNG_NSCR_RESET_VALUE }, /**< \ref RNG_CONFIG_SELECTION_AIS_31_ENTROPY */
+#if ( RNG_CR_NIST_VALUE == 0x00F00D00u )
+    { .Supported = RNG_FUNCTION_ACTIVE, .CrRegVal = RNG_CR_AIS31_SPEED_VALUE  , .HtcrRegVal = RNG_HTCR_AIS31_VALUE, .NscrRegVal = RNG_NSCR_RESET_VALUE }, /**< \ref RNG_CONFIG_SELECTION_AIS_31_SPEED   */
+    { .Supported = RNG_FUNCTION_ACTIVE, .CrRegVal = RNG_CR_AIS31_ENTROPY_VALUE, .HtcrRegVal = RNG_HTCR_AIS31_VALUE, .NscrRegVal = RNG_NSCR_RESET_VALUE }, /**< \ref RNG_CONFIG_SELECTION_AIS_31_ENTROPY */
+#endif /* RNG_CR_NIST_VALUE */
 };
 
 _Static_assert( RNG_CONFIG_SELECTION_CNT == ( sizeof( rng_ConfigList ) / sizeof( rng_ConfigurationList_t ) ), "RNG configuration LUT size mismatch" );
