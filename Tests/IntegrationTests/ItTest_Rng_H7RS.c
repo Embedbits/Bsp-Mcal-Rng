@@ -289,7 +289,10 @@ void It_Rng_ClockErrorDetect_LsiClock_ReportsClockError( void )
 
     TEST_ASSERT_EQUAL( RNG_REQUEST_OK, Rng_Set_ExecActive( RNG_PERIPH_1 ) );
 
-    for( uint32_t loopCnt = 0u; ( IT_RNG_WAIT_LOOPS > loopCnt ) && ( 0u == itRng_ErrorCnt ); loopCnt ++ )
+    for( uint32_t loopCnt = 0u;
+         ( IT_RNG_WAIT_LOOPS > loopCnt ) &&
+         ( 0u == itRng_ErrorCnt );
+         loopCnt ++ )
     {
         Rng_Task();
     }
@@ -351,7 +354,10 @@ static rng_RequestState_t It_Rng_Wait_Data( rng_RandomData_t * const data )
 {
     rng_RequestState_t retState = RNG_REQUEST_ERROR;
 
-    for( uint32_t loopCnt = 0u; ( IT_RNG_WAIT_LOOPS > loopCnt ) && ( RNG_REQUEST_OK != retState ); loopCnt ++ )
+    for( uint32_t loopCnt = 0u;
+         ( IT_RNG_WAIT_LOOPS > loopCnt ) &&
+         ( RNG_REQUEST_OK != retState );
+         loopCnt ++ )
     {
         retState = Rng_Get_Data( RNG_PERIPH_1, data );
     }
@@ -363,7 +369,10 @@ static rng_RequestState_t It_Rng_Wait_Data( rng_RandomData_t * const data )
 /** Waits until data ready callback is called required number of times (task optionally called) */
 static void It_Rng_Wait_DataCnt( uint32_t dataCnt, rng_FunctionState_t taskState )
 {
-    for( uint32_t loopCnt = 0u; ( IT_RNG_WAIT_LOOPS > loopCnt ) && ( dataCnt > itRng_DataCnt ); loopCnt ++ )
+    for( uint32_t loopCnt = 0u;
+         ( IT_RNG_WAIT_LOOPS > loopCnt ) &&
+         ( dataCnt > itRng_DataCnt );
+         loopCnt ++ )
     {
         if( RNG_FUNCTION_ACTIVE == taskState )
         {
@@ -384,7 +393,8 @@ static void It_Rng_DataRdyCallback( rng_RandomData_t value )
 
     itRng_DataCnt++;
 
-    if( ( 0u != itRng_PauseCnt ) && ( itRng_PauseCnt <= itRng_DataCnt ) )
+    if( ( 0u               != itRng_PauseCnt ) &&
+        ( itRng_PauseCnt <= itRng_DataCnt  )    )
     {
         (void)Rng_Set_ExecPauseActive( RNG_PERIPH_1 );
     }

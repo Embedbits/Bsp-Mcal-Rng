@@ -36,7 +36,12 @@ with a common public interface.
   Locked configuration (CONFIGLOCK) is reported as error.
 - **Interrupt** - on devices with HASH peripheral (STM32H730 / H733 / H735 / H750 / H753 / H755 / H757 /
   H7B0 / H7B3) the RNG interrupt is shared with HASH (`NVIC_PERIPH_IRQ_HASH_RNG`). STM32H7S has own RNG and HASH
-  interrupts.
+  interrupts. The RNG interrupt line is the line of the HASH in the ISR / DMA mode of the Hash module as well:
+  `Rng_Init`, `Rng_Deinit` and `Rng_Set_IrqInactive` deactivate the line, `Rng_Set_IrqActive` registers the RNG
+  handler on it. `Hash_Init` rejects the Hash ISR / DMA mode while the line is activated with the RNG handler. Rules
+  for an application with both modules: the Rng interrupt mode and the Hash ISR / DMA mode exclude each other; with
+  the Hash ISR / DMA mode call `Rng_Init` before `Hash_Init` and `Rng_Deinit` after `Hash_Deinit` (see the Hash
+  README). With the Hash POLL mode there is no such rule.
 - Before a kernel clock source other than LSI is selected, LSI is started and stopped again if it is not
   running - a kernel clock switch pending from LSI after a system reset is completed (observed on STM32H5,
   AB#954; applied to STM32H7 as a precaution, not needed on STM32H7R / H7S without multiplexer).
