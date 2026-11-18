@@ -155,6 +155,10 @@ void It_Rng_Get_Data_Running_DeliversRandomBlocks( void )
         {
             diffCnt++;
         }
+        else
+        {
+            /* No action required */
+        }
     }
 
     TEST_ASSERT_NOT_EQUAL_UINT32( 0u, orValue );
